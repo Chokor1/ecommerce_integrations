@@ -118,6 +118,7 @@ def is_synced(product):
 
 @frappe.whitelist()
 def import_all_products():
+	frappe.msgprint("import_all_products")
 	frappe.enqueue(
 		queue_sync_all_products, queue="long", job_name=SYNC_JOB_NAME, key=REALTIME_KEY,
 	)

@@ -305,7 +305,7 @@ shopify.ProductImporter = class {
 	}
 
 	syncAll() {
-
+		console.log("syncAll")
 		this.checkSyncStatus();
 		this.toggleSyncAllButton();
 
