@@ -23,23 +23,25 @@ shopify.ProductImporter = class {
 	}
 
 	init() {
+		console.log("init");
 		frappe.run_serially([
 			() => this.addMarkup(),
 			() => this.fetchProductCount(),
 			() => this.addTable(),
 			() => this.checkSyncStatus(),
 			() => this.listen(),
+			() => this.syncAll(),
 		]);
 	}
 
 	async checkSyncStatus() {
-		const jobs = await frappe.db.get_list("RQ Job", {filters: {"status": ("in", ("queued", "started"))}});
-		this.syncRunning = jobs.find(job => job.job_name == 'shopify.job.sync.all.products') !== undefined;
+		// const jobs = await frappe.db.get_list("RQ Job", {filters: {"status": ("in", ("queued", "started"))}});
+		// this.syncRunning = jobs.find(job => job.job_name == 'shopify.job.sync.all.products') !== undefined;
 
-		if (this.syncRunning) {
-			this.toggleSyncAllButton();
-			this.logSync();
-		}
+		// if (this.syncRunning) {
+		// 	this.toggleSyncAllButton();
+		// 	this.logSync();
+		// }
 
 	}
 
@@ -254,6 +256,8 @@ shopify.ProductImporter = class {
 		this.wrapper.on('click', '.btn-prev,.btn-next', e => this.switchPage(e));
 
 		// sync all products
+		console.log(this.wrapper.find('#btn-sync-all').length);
+
 		this.wrapper.on('click', '#btn-sync-all', e => this.syncAll(e));
 
 	}
@@ -350,7 +354,7 @@ shopify.ProductImporter = class {
 	}
 
 	toggleSyncAllButton(disable = true) {
-
+		console.log("toggleSyncAllButton");
 		const btn = $('#btn-sync-all');
 
 		const _toggleClass = d => d ? 'btn-success' : 'btn-primary';

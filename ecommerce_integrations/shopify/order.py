@@ -102,6 +102,9 @@ def create_sales_order(shopify_order, setting, company=None):
 			return ""
 
 		taxes = get_order_taxes(shopify_order, setting, items)
+		tax_category = setting.tax_category
+		if not tax_category:
+			tax_category = get_dummy_tax_category()
 		so = frappe.get_doc(
 			{
 				"doctype": "Sales Order",
@@ -116,7 +119,7 @@ def create_sales_order(shopify_order, setting, company=None):
 				"ignore_pricing_rule": 1,
 				"items": items,
 				"taxes": taxes,
-				"tax_category": get_dummy_tax_category(),
+				"tax_category": tax_category,
 			}
 		)
 
@@ -211,7 +214,7 @@ def get_order_taxes(shopify_order, setting, items):
 					"tax_amount": tax.get("price"),
 					"included_in_print_rate": 0,
 					"cost_center": setting.cost_center,
-					"item_wise_tax_detail": {item_code: [flt(tax.get("rate")) * 100, flt(tax.get("price"))]},
+					"item_wise_tax_detail": {item_code: [round(flt(tax.get("rate")) * 100, 2), flt(tax.get("price"))]},
 					"dont_recompute_tax": 1,
 				}
 			)

@@ -33,6 +33,7 @@
   "sync_sales_invoice",
   "add_shipping_as_item",
   "consolidate_taxes",
+  "tax_category",
   "section_break_22",
   "html_16",
   "taxes",
@@ -387,12 +388,18 @@
    "fieldtype": "Link",
    "label": "Default Shipping Charges Account",
    "options": "Account"
+  },
+  {
+   "fieldname": "tax_category",
+   "fieldtype": "Link",
+   "label": "Tax Category",
+   "options": "Tax Category"
   }
  ],
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2023-10-24 10:38:49.247431",
+ "modified": "2025-05-15 11:55:01.491453",
  "modified_by": "Administrator",
  "module": "shopify",
  "name": "Shopify Setting",
@@ -411,6 +418,5 @@
  ],
  "sort_field": "modified",
  "sort_order": "DESC",
- "states": [],
  "track_changes": 1
 }
