@@ -4,7 +4,7 @@ import frappe
 from frappe import _, msgprint
 from frappe.utils import cint, cstr
 from frappe.utils.nestedset import get_root_of
-from shopify.resources import Product, Variant
+from shopify.resources import Product, Variant, CustomCollection, Collect
 
 from ecommerce_integrations.ecommerce_integrations.doctype.ecommerce_item import ecommerce_item
 from ecommerce_integrations.shopify.connection import temp_shopify_session
@@ -123,7 +123,7 @@ class ShopifyProduct:
 			"item_code": cstr(product_dict.get("item_code")) or cstr(product_dict.get("id")),
 			"item_name": product_dict.get("title", "").strip(),
 			"description": product_dict.get("body_html") or product_dict.get("title"),
-			"item_group": self._get_item_group(product_dict.get("product_type")),
+			"brand": product_dict.get("product_type"),			
 			"has_variants": has_variant,
 			"attributes": attributes or [],
 			"stock_uom": product_dict.get("uom") or _("Nos"),
@@ -187,24 +187,6 @@ class ShopifyProduct:
 			as_list=1,
 		)
 		return attribute_value[0][0] if len(attribute_value) > 0 else cint(variant_attr_val)
-
-	def _get_item_group(self, product_type=None):
-		parent_item_group = get_root_of("Item Group")
-
-		if not product_type:
-			return parent_item_group
-
-		if frappe.db.get_value("Item Group", product_type, "name"):
-			return product_type
-		item_group = frappe.get_doc(
-			{
-				"doctype": "Item Group",
-				"item_group_name": product_type,
-				"parent_item_group": parent_item_group,
-				"is_group": "No",
-			}
-		).insert()
-		return item_group.name
 
 	def _get_supplier(self, product_dict):
 		if product_dict.get("vendor"):
@@ -405,6 +387,7 @@ def upload_erpnext_item(doc, method=None):
 				add_or_update_variant(Variant(variant_attributes), product.variants)
 
 			product.save()  # push variant
+			sync_collections_from_erp_item(product.id, template_item)
 
 			ecom_items = list(set([item, template_item]))
 			for d in ecom_items:
@@ -452,6 +435,9 @@ def upload_erpnext_item(doc, method=None):
 				# product.variants.append(Variant(variant_attributes))
 				add_or_update_variant(Variant(variant_attributes), product.variants)
 			is_successful = product.save()
+			if is_successful:
+				unlink_collections_from_product(product.id)
+				sync_collections_from_erp_item(product.id, template_item)
 			if is_successful and item.variant_of:
 				map_erpnext_variant_to_shopify_variant(product, item, variant_attributes)
 
@@ -504,12 +490,103 @@ def map_erpnext_variant_to_shopify_variant(
 	return variant_product_id
 
 
+
+
+
+#update by abbass
+def get_or_create_shopify_collection(title: str) -> Optional[int]:
+	"""Fetch or create a Shopify CustomCollection by title."""
+	collections = CustomCollection.find()
+	for col in collections:
+		if col.title.strip().lower() == title.strip().lower():
+			return col.id
+
+    # Create if not found
+	collection = CustomCollection()
+	collection.title = title
+	collection.published = True
+	if collection.save():
+		return collection.id
+	else:
+		create_shopify_log("Failed to create collection", error=True)
+		return None
+
+
+def link_product_to_collections(product_id: int, collection_titles: List[str]):
+	for title in collection_titles:
+		collection_id = get_or_create_shopify_collection(title)
+		if not collection_id:
+			continue
+
+		existing = Collect.find(product_id=product_id, collection_id=collection_id)
+		if not existing:
+			collect = Collect()
+			collect.product_id = product_id
+			collect.collection_id = collection_id
+			try:
+				collect.save()
+			except Exception as e:
+				create_shopify_log(f"Failed to link product to collection {title}: {e}", error=True)
+
+
+def get_all_parent_groups(item_group: str) -> List[str]:
+	parents: List[str] = []
+
+	def recurse(group: str):
+		parent = frappe.db.get_value("Item Group", group, "parent_item_group")
+		if parent and parent != "All Item Groups":
+			parents.append(parent)
+			recurse(parent)
+
+	recurse(item_group)
+	return parents
+
+
+def sync_collections_from_erp_item(product_id: int, erpnext_item):
+
+	collections = []
+	if erpnext_item.item_group:
+		collections.append(erpnext_item.item_group)
+
+		parent_groups = get_all_parent_groups(erpnext_item.item_group)
+		collections.extend(parent_groups)
+
+	gender = getattr(erpnext_item, "gender", None)
+	if gender:
+		collections.append(gender)
+
+	if collections:
+		link_product_to_collections(product_id, collections)
+
+
+
+def unlink_collections_from_product(product_id: int):
+	try:
+		collects = Collect.find(product_id=product_id)
+
+		for collect in collects:
+			try:
+				collect.destroy()
+			except Exception as e:
+				frappe.log_error(f"Failed to delete collect {collect.id}: {e}", "Shopify Sync Error")
+
+	except Exception as e:
+		frappe.log_error(f"Failed to fetch collects for product {product_id}: {e}", "Shopify Sync Error")
+
+
+
+
 def map_erpnext_item_to_shopify(shopify_product: Product, erpnext_item):
 	"""Map erpnext fields to shopify, called both when updating and creating new products."""
 
 	shopify_product.title = erpnext_item.item_name
 	shopify_product.body_html = erpnext_item.description
-	shopify_product.product_type = erpnext_item.item_group
+
+
+	shopify_product.product_type = erpnext_item.brand
+
+
+		
 
 	if erpnext_item.weight_uom in WEIGHT_TO_ERPNEXT_UOM_MAP.values():
 		# reverse lookup for key
