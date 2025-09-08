@@ -380,10 +380,11 @@ def upload_erpnext_item(doc, method=None):
 							),
 						}
 					)
-					try:
-						variant_attributes[f"option{i+1}"] = item.attributes[i].attribute_value
-					except IndexError:
-						frappe.throw(_("Shopify Error: Missing value for attribute {}").format(attr.attribute))
+				
+				# Map variant attributes to options using the new intelligent mapping
+				option_attributes = _map_variant_attributes_to_options(item, template_item)
+				variant_attributes.update(option_attributes)
+				
 				add_or_update_variant(Variant(variant_attributes), product.variants)
 
 			product.save()  # push variant
@@ -428,10 +429,11 @@ def upload_erpnext_item(doc, method=None):
 							),
 						}
 					)
-					try:
-						variant_attributes[f"option{i+1}"] = item.attributes[i].attribute_value
-					except IndexError:
-						frappe.throw(_("Shopify Error: Missing value for attribute {}").format(attr.attribute))
+				
+				# Map variant attributes to options using the new intelligent mapping
+				option_attributes = _map_variant_attributes_to_options(item, template_item)
+				variant_attributes.update(option_attributes)
+				
 				# product.variants.append(Variant(variant_attributes))
 				add_or_update_variant(Variant(variant_attributes), product.variants)
 			is_successful = product.save()
@@ -442,6 +444,106 @@ def upload_erpnext_item(doc, method=None):
 				map_erpnext_variant_to_shopify_variant(product, item, variant_attributes)
 
 			write_upload_log(status=is_successful, product=product, item=item, action="Updated")
+
+
+def _get_variant_attribute_value(item, attribute_name, index):
+	"""Safely get variant attribute value, handling cases where variant doesn't have all template attributes."""
+	try:
+		# First try to find the attribute by name in the item's attributes
+		for attr in item.attributes:
+			if attr.attribute == attribute_name:
+				return attr.attribute_value
+		
+		# If not found by name, try by index (fallback for backward compatibility)
+		if index < len(item.attributes):
+			return item.attributes[index].attribute_value
+		
+		# If still not found, return None (will be handled as empty option)
+		return None
+	except (IndexError, AttributeError):
+		return None
+
+def _map_variant_attributes_to_options(item, template_item):
+	"""Map variant attributes to Shopify option structure, handling missing attributes intelligently."""
+	variant_attributes = {}
+	
+	# Create a mapping of attribute names to their values for this variant
+	variant_attr_map = {}
+	for attr in item.attributes:
+		variant_attr_map[attr.attribute] = attr.attribute_value
+	
+	# Map each template attribute to the correct option position
+	for i, template_attr in enumerate(template_item.attributes):
+		option_key = f"option{i+1}"
+		attr_name = template_attr.attribute
+		
+		# First try to get the value from this variant
+		if attr_name in variant_attr_map and variant_attr_map[attr_name]:
+			variant_attributes[option_key] = variant_attr_map[attr_name]
+		else:
+			# If not found, try to get default from other variants
+			default_value = _get_default_attribute_value_from_template(template_item, attr_name, i)
+			if default_value:
+				variant_attributes[option_key] = default_value
+			else:
+				# Last resort: use the first available value from the attribute definition
+				try:
+					attr_values = frappe.db.get_all(
+						"Item Attribute Value", 
+						{"parent": attr_name}, 
+						pluck="attribute_value"
+					)
+					if attr_values:
+						variant_attributes[option_key] = attr_values[0]
+					else:
+						# If still no value, use a generic fallback
+						variant_attributes[option_key] = f"Default {attr_name}"
+				except Exception:
+					variant_attributes[option_key] = f"Default {attr_name}"
+	
+	return variant_attributes
+
+def _get_default_attribute_value_from_template(template_item, attribute_name, index):
+	"""Get a default attribute value from other variants of the same template."""
+	try:
+		# Get all variants of this template
+		variants = frappe.get_all(
+			"Item",
+			filters={"variant_of": template_item.name},
+			fields=["name"]
+		)
+		
+		# Look for the first variant that has this attribute
+		for variant in variants:
+			try:
+				variant_doc = frappe.get_doc("Item", variant.name)
+				if variant_doc.attributes:
+					# Find the attribute by name
+					for attr in variant_doc.attributes:
+						if attr.attribute == attribute_name:
+							return attr.attribute_value
+					
+					# Fallback: try by index
+					if index < len(variant_doc.attributes):
+						return variant_doc.attributes[index].attribute_value
+			except Exception:
+				continue
+		
+		# If no variant has this attribute, try to get a default from the attribute values
+		try:
+			attr_values = frappe.db.get_all(
+				"Item Attribute Value", 
+				{"parent": attribute_name}, 
+				pluck="attribute_value"
+			)
+			if attr_values:
+				return attr_values[0]  # Return the first available value
+		except Exception:
+			pass
+		
+		return None
+	except (Exception, AttributeError):
+		return None
 
 
 def add_or_update_variant(new_variant: Variant, variants: List[Variant]):
