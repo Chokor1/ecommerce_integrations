@@ -595,23 +595,74 @@ def map_erpnext_variant_to_shopify_variant(
 
 
 
+# Collection cache to avoid repeated API calls
+_collection_cache = {}
+
+def clear_collection_cache():
+	"""Clear the collection cache. Useful for testing or when collections are modified externally."""
+	global _collection_cache
+	_collection_cache = {}
+
 #update by abbass
 def get_or_create_shopify_collection(title: str) -> Optional[int]:
 	"""Fetch or create a Shopify CustomCollection by title."""
-	collections = CustomCollection.find()
+	# Check cache first
+	cache_key = title.strip().lower()
+	if cache_key in _collection_cache:
+		return _collection_cache[cache_key]
+	
+	# Get all collections with pagination to avoid missing collections
+	collections = []
+	page = 1
+	limit = 250  # Shopify's max limit per page
+	
+	while True:
+		page_collections = CustomCollection.find(limit=limit, page=page)
+		if not page_collections:
+			break
+		collections.extend(page_collections)
+		if len(page_collections) < limit:
+			break
+		page += 1
+	
+	# Search for existing collection with case-insensitive comparison
 	for col in collections:
-		if col.title.strip().lower() == title.strip().lower():
+		col_title = col.title.strip().lower()
+		# Cache all found collections for future use
+		_collection_cache[col_title] = col.id
+		if col_title == cache_key:
 			return col.id
 
-    # Create if not found
-	collection = CustomCollection()
-	collection.title = title
-	collection.published = True
-	if collection.save():
-		return collection.id
-	else:
-		create_shopify_log("Failed to create collection", error=True)
-		return None
+	# Create if not found - add retry logic for race conditions
+	max_retries = 3
+	for attempt in range(max_retries):
+		try:
+			collection = CustomCollection()
+			collection.title = title
+			collection.published = True
+			if collection.save():
+				create_shopify_log(f"Created new collection: {title}")
+				# Cache the new collection
+				_collection_cache[cache_key] = collection.id
+				return collection.id
+			else:
+				create_shopify_log(f"Failed to create collection {title} (attempt {attempt + 1})", error=True)
+		except Exception as e:
+			create_shopify_log(f"Exception creating collection {title} (attempt {attempt + 1}): {e}", error=True)
+			if attempt < max_retries - 1:
+				# Wait a bit before retrying to avoid race conditions
+				import time
+				time.sleep(0.5)
+			else:
+				# On final attempt, try to find the collection again in case another process created it
+				collections = CustomCollection.find()
+				for col in collections:
+					if col.title.strip().lower() == cache_key:
+						_collection_cache[cache_key] = col.id
+						return col.id
+	
+	create_shopify_log(f"Failed to create collection {title} after {max_retries} attempts", error=True)
+	return None
 
 
 def link_product_to_collections(product_id: int, collection_titles: List[str]):
@@ -645,7 +696,7 @@ def get_all_parent_groups(item_group: str) -> List[str]:
 
 
 def sync_collections_from_erp_item(product_id: int, erpnext_item):
-
+	"""Sync collections from ERPNext item to Shopify product."""
 	collections = []
 	if erpnext_item.item_group:
 		collections.append(erpnext_item.item_group)
@@ -658,7 +709,10 @@ def sync_collections_from_erp_item(product_id: int, erpnext_item):
 		collections.append(gender)
 
 	if collections:
+		create_shopify_log(f"Syncing collections for product {product_id}: {collections}")
 		link_product_to_collections(product_id, collections)
+	else:
+		create_shopify_log(f"No collections to sync for product {product_id}")
 
 
 
