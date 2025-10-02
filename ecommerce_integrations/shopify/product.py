@@ -595,91 +595,175 @@ def map_erpnext_variant_to_shopify_variant(
 
 
 
-# Collection cache to avoid repeated API calls
+# Cache to store recently fetched collections to avoid repeated API calls
 _collection_cache = {}
+_cache_timestamp = None
+CACHE_DURATION = 300  # 5 minutes
 
 def clear_collection_cache():
-	"""Clear the collection cache. Useful for testing or when collections are modified externally."""
-	global _collection_cache
+	"""Clear the collection cache to force fresh data fetch."""
+	global _collection_cache, _cache_timestamp
 	_collection_cache = {}
+	_cache_timestamp = None
+	create_shopify_log(message="Collection cache cleared")
+
+@temp_shopify_session
+def get_collection_by_title(title):
+	"""Get a specific collection by title using direct search."""
+	try:
+		collections = CustomCollection.find(title=title)
+		if collections:
+			create_shopify_log(message=f"Found collection '{title}' (ID: {collections[0].id})")
+			return collections[0]
+		else:
+			create_shopify_log(message=f"No collection found with title '{title}'")
+			return None
+	except Exception as e:
+		create_shopify_log(message=f"Error searching for collection '{title}': {str(e)}", error=True)
+		return None
+
+@temp_shopify_session
+def find_collection_case_insensitive(target_title):
+	"""Find collection with case-insensitive matching."""
+	try:
+		all_collections = CustomCollection.find()
+		if all_collections:
+			for col in all_collections:
+				if hasattr(col, 'title') and col.title:
+					col_title = col.title.strip()
+					if col_title.lower() == target_title.lower():
+						create_shopify_log(message=f"Found collection (case-insensitive): '{col_title}' (ID: {col.id})")
+						return col
+		return None
+	except Exception as e:
+		create_shopify_log(message=f"Error in case-insensitive search for '{target_title}': {str(e)}", error=True)
+		return None
 
 #update by abbass
+@temp_shopify_session
 def get_or_create_shopify_collection(title: str) -> Optional[int]:
 	"""Fetch or create a Shopify CustomCollection by title."""
+	if not title or not title.strip():
+		create_shopify_log(message="Empty collection title provided", error=True)
+		return None
+	
+	# Normalize the title for comparison
+	normalized_title = title.strip()
+	
 	# Check cache first
-	cache_key = title.strip().lower()
-	if cache_key in _collection_cache:
-		return _collection_cache[cache_key]
+	import time
+	global _collection_cache, _cache_timestamp
 	
-	# Get all collections with pagination to avoid missing collections
-	collections = []
-	page = 1
-	limit = 250  # Shopify's max limit per page
+	current_time = time.time()
+	if (_cache_timestamp is None or current_time - _cache_timestamp > CACHE_DURATION):
+		_collection_cache = {}
+		_cache_timestamp = current_time
+		create_shopify_log(message="Collection cache expired, fetching fresh data")
 	
-	while True:
-		page_collections = CustomCollection.find(limit=limit, page=page)
-		if not page_collections:
-			break
-		collections.extend(page_collections)
-		if len(page_collections) < limit:
-			break
-		page += 1
+	# Check if we have this collection in cache
+	if normalized_title.lower() in _collection_cache:
+		cached_id = _collection_cache[normalized_title.lower()]
+		create_shopify_log(message=f"Found collection '{normalized_title}' in cache (ID: {cached_id})")
+		return cached_id
 	
-	# Search for existing collection with case-insensitive comparison
-	for col in collections:
-		col_title = col.title.strip().lower()
-		# Cache all found collections for future use
-		_collection_cache[col_title] = col.id
-		if col_title == cache_key:
-			return col.id
+	try:
+		# Search for existing collection by title (case-sensitive search first)
+		existing_collection = get_collection_by_title(normalized_title)
+		if existing_collection:
+			# Store in cache for future use
+			_collection_cache[normalized_title.lower()] = existing_collection.id
+			create_shopify_log(message=f"Found existing collection: {existing_collection.title} (ID: {existing_collection.id})")
+			return existing_collection.id
+		
+		# If not found with exact match, try case-insensitive search
+		create_shopify_log(message=f"No exact match found for '{normalized_title}', trying case-insensitive search")
+		existing_collection = find_collection_case_insensitive(normalized_title)
+		if existing_collection:
+			# Store in cache for future use
+			_collection_cache[normalized_title.lower()] = existing_collection.id
+			create_shopify_log(message=f"Found existing collection (case-insensitive): {existing_collection.title} (ID: {existing_collection.id})")
+			return existing_collection.id
+		
+		create_shopify_log(message=f"No existing collection found for '{normalized_title}', creating new one")
 
-	# Create if not found - add retry logic for race conditions
-	max_retries = 3
-	for attempt in range(max_retries):
+		# Create new collection if not found
+		collection = CustomCollection()
+		collection.title = normalized_title
+		collection.published = True
+		
 		try:
-			collection = CustomCollection()
-			collection.title = title
-			collection.published = True
 			if collection.save():
-				create_shopify_log(f"Created new collection: {title}")
-				# Cache the new collection
-				_collection_cache[cache_key] = collection.id
+				# Store in cache for future use
+				_collection_cache[normalized_title.lower()] = collection.id
+				create_shopify_log(message=f"Successfully created new collection: {normalized_title} (ID: {collection.id})")
 				return collection.id
 			else:
-				create_shopify_log(f"Failed to create collection {title} (attempt {attempt + 1})", error=True)
-		except Exception as e:
-			create_shopify_log(f"Exception creating collection {title} (attempt {attempt + 1}): {e}", error=True)
-			if attempt < max_retries - 1:
-				# Wait a bit before retrying to avoid race conditions
-				import time
-				time.sleep(0.5)
-			else:
-				# On final attempt, try to find the collection again in case another process created it
-				collections = CustomCollection.find()
-				for col in collections:
-					if col.title.strip().lower() == cache_key:
-						_collection_cache[cache_key] = col.id
-						return col.id
-	
-	create_shopify_log(f"Failed to create collection {title} after {max_retries} attempts", error=True)
-	return None
+				error_msg = "Unknown error"
+				if hasattr(collection, 'errors') and collection.errors:
+					error_msg = collection.errors.full_messages()
+				create_shopify_log(message=f"Failed to create collection '{normalized_title}': {error_msg}", error=True)
+				return None
+		except Exception as save_error:
+			create_shopify_log(message=f"Exception during collection save for '{normalized_title}': {str(save_error)}", error=True)
+			return None
+			
+	except Exception as e:
+		create_shopify_log(message=f"Error in get_or_create_shopify_collection for '{normalized_title}': {str(e)}", error=True)
+		return None
 
 
+@temp_shopify_session
 def link_product_to_collections(product_id: int, collection_titles: List[str]):
-	for title in collection_titles:
+	"""Link a product to multiple collections, avoiding duplicates."""
+	if not collection_titles:
+		return
+		
+	# Remove duplicates and empty titles
+	unique_titles = list(set([title.strip() for title in collection_titles if title and title.strip()]))
+	
+	if not unique_titles:
+		create_shopify_log(message="No valid collection titles provided for linking")
+		return
+	
+	create_shopify_log(message=f"Linking product {product_id} to collections: {unique_titles}")
+	
+	for title in unique_titles:
 		collection_id = get_or_create_shopify_collection(title)
 		if not collection_id:
+			create_shopify_log(message=f"Failed to get/create collection '{title}', skipping link", error=True)
 			continue
 
-		existing = Collect.find(product_id=product_id, collection_id=collection_id)
-		if not existing:
+		try:
+			# Check if the product is already linked to this collection
+			existing_collects = []
+			try:
+				existing_collects = Collect.find(product_id=product_id, collection_id=collection_id)
+			except Exception as find_error:
+				create_shopify_log(message=f"Error checking existing collects for product {product_id}, collection {collection_id}: {str(find_error)}", error=True)
+				# Continue with creation attempt even if we can't check existing links
+			
+			if existing_collects:
+				create_shopify_log(message=f"Product {product_id} already linked to collection '{title}' (ID: {collection_id})")
+				continue
+				
+			# Create new collect link
 			collect = Collect()
 			collect.product_id = product_id
 			collect.collection_id = collection_id
+			
 			try:
-				collect.save()
-			except Exception as e:
-				create_shopify_log(f"Failed to link product to collection {title}: {e}", error=True)
+				if collect.save():
+					create_shopify_log(message=f"Successfully linked product {product_id} to collection '{title}' (ID: {collection_id})")
+				else:
+					error_msg = "Unknown error"
+					if hasattr(collect, 'errors') and collect.errors:
+						error_msg = collect.errors.full_messages()
+					create_shopify_log(message=f"Failed to save collect link for product {product_id} to collection '{title}': {error_msg}", error=True)
+			except Exception as save_error:
+				create_shopify_log(message=f"Exception during collect save for product {product_id} to collection '{title}': {str(save_error)}", error=True)
+				
+		except Exception as e:
+			create_shopify_log(message=f"Failed to link product {product_id} to collection '{title}': {str(e)}", error=True)
 
 
 def get_all_parent_groups(item_group: str) -> List[str]:
@@ -696,26 +780,32 @@ def get_all_parent_groups(item_group: str) -> List[str]:
 
 
 def sync_collections_from_erp_item(product_id: int, erpnext_item):
-	"""Sync collections from ERPNext item to Shopify product."""
+	"""Sync collections from ERPNext item to Shopify, avoiding duplicates."""
 	collections = []
+	
+	# Add item group and its parent groups
 	if erpnext_item.item_group:
 		collections.append(erpnext_item.item_group)
-
 		parent_groups = get_all_parent_groups(erpnext_item.item_group)
 		collections.extend(parent_groups)
 
+	# Add gender if it exists
 	gender = getattr(erpnext_item, "gender", None)
-	if gender:
-		collections.append(gender)
+	if gender and gender.strip():
+		collections.append(gender.strip())
 
+	# Remove duplicates and empty values
+	collections = list(set([col.strip() for col in collections if col and col.strip()]))
+	
 	if collections:
-		create_shopify_log(f"Syncing collections for product {product_id}: {collections}")
+		create_shopify_log(message=f"Syncing collections for product {product_id}: {collections}")
 		link_product_to_collections(product_id, collections)
 	else:
-		create_shopify_log(f"No collections to sync for product {product_id}")
+		create_shopify_log(message=f"No collections to sync for product {product_id}")
 
 
 
+@temp_shopify_session
 def unlink_collections_from_product(product_id: int):
 	try:
 		collects = Collect.find(product_id=product_id)
@@ -728,6 +818,38 @@ def unlink_collections_from_product(product_id: int):
 
 	except Exception as e:
 		frappe.log_error(f"Failed to fetch collects for product {product_id}: {e}", "Shopify Sync Error")
+
+
+def test_collection_functions():
+	"""Test function to debug collection creation and linking issues."""
+	try:
+		create_shopify_log(message="Testing collection functions...")
+		
+		# Test 1: Try direct search for existing collection
+		test_title = "Test Collection"
+		existing = get_collection_by_title(test_title)
+		if existing:
+			create_shopify_log(message=f"Found existing collection: {existing.title} (ID: {existing.id})")
+		else:
+			create_shopify_log(message=f"No existing collection found for '{test_title}'")
+		
+		# Test 2: Try to create/find a test collection
+		test_collection_id = get_or_create_shopify_collection(test_title)
+		if test_collection_id:
+			create_shopify_log(message=f"Successfully created/found test collection with ID: {test_collection_id}")
+		else:
+			create_shopify_log(message="Failed to create/find test collection", error=True)
+		
+		# Test 3: Test cache functionality
+		create_shopify_log(message="Testing cache functionality...")
+		cached_id = get_or_create_shopify_collection(test_title)
+		if cached_id:
+			create_shopify_log(message=f"Cache test successful - found collection ID: {cached_id}")
+		else:
+			create_shopify_log(message="Cache test failed", error=True)
+			
+	except Exception as e:
+		create_shopify_log(message=f"Error in test_collection_functions: {str(e)}", error=True)
 
 
 
