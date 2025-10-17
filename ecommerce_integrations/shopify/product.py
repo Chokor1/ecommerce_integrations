@@ -380,10 +380,11 @@ def upload_erpnext_item(doc, method=None):
 							),
 						}
 					)
-					try:
-						variant_attributes[f"option{i+1}"] = item.attributes[i].attribute_value
-					except IndexError:
-						frappe.throw(_("Shopify Error: Missing value for attribute {}").format(attr.attribute))
+				
+				# Map variant attributes to options using the new intelligent mapping
+				option_attributes = _map_variant_attributes_to_options(item, template_item)
+				variant_attributes.update(option_attributes)
+				
 				add_or_update_variant(Variant(variant_attributes), product.variants)
 
 			product.save()  # push variant
@@ -428,10 +429,11 @@ def upload_erpnext_item(doc, method=None):
 							),
 						}
 					)
-					try:
-						variant_attributes[f"option{i+1}"] = item.attributes[i].attribute_value
-					except IndexError:
-						frappe.throw(_("Shopify Error: Missing value for attribute {}").format(attr.attribute))
+				
+				# Map variant attributes to options using the new intelligent mapping
+				option_attributes = _map_variant_attributes_to_options(item, template_item)
+				variant_attributes.update(option_attributes)
+				
 				# product.variants.append(Variant(variant_attributes))
 				add_or_update_variant(Variant(variant_attributes), product.variants)
 			is_successful = product.save()
@@ -442,6 +444,106 @@ def upload_erpnext_item(doc, method=None):
 				map_erpnext_variant_to_shopify_variant(product, item, variant_attributes)
 
 			write_upload_log(status=is_successful, product=product, item=item, action="Updated")
+
+
+def _get_variant_attribute_value(item, attribute_name, index):
+	"""Safely get variant attribute value, handling cases where variant doesn't have all template attributes."""
+	try:
+		# First try to find the attribute by name in the item's attributes
+		for attr in item.attributes:
+			if attr.attribute == attribute_name:
+				return attr.attribute_value
+		
+		# If not found by name, try by index (fallback for backward compatibility)
+		if index < len(item.attributes):
+			return item.attributes[index].attribute_value
+		
+		# If still not found, return None (will be handled as empty option)
+		return None
+	except (IndexError, AttributeError):
+		return None
+
+def _map_variant_attributes_to_options(item, template_item):
+	"""Map variant attributes to Shopify option structure, handling missing attributes intelligently."""
+	variant_attributes = {}
+	
+	# Create a mapping of attribute names to their values for this variant
+	variant_attr_map = {}
+	for attr in item.attributes:
+		variant_attr_map[attr.attribute] = attr.attribute_value
+	
+	# Map each template attribute to the correct option position
+	for i, template_attr in enumerate(template_item.attributes):
+		option_key = f"option{i+1}"
+		attr_name = template_attr.attribute
+		
+		# First try to get the value from this variant
+		if attr_name in variant_attr_map and variant_attr_map[attr_name]:
+			variant_attributes[option_key] = variant_attr_map[attr_name]
+		else:
+			# If not found, try to get default from other variants
+			default_value = _get_default_attribute_value_from_template(template_item, attr_name, i)
+			if default_value:
+				variant_attributes[option_key] = default_value
+			else:
+				# Last resort: use the first available value from the attribute definition
+				try:
+					attr_values = frappe.db.get_all(
+						"Item Attribute Value", 
+						{"parent": attr_name}, 
+						pluck="attribute_value"
+					)
+					if attr_values:
+						variant_attributes[option_key] = attr_values[0]
+					else:
+						# If still no value, use a generic fallback
+						variant_attributes[option_key] = f"Default {attr_name}"
+				except Exception:
+					variant_attributes[option_key] = f"Default {attr_name}"
+	
+	return variant_attributes
+
+def _get_default_attribute_value_from_template(template_item, attribute_name, index):
+	"""Get a default attribute value from other variants of the same template."""
+	try:
+		# Get all variants of this template
+		variants = frappe.get_all(
+			"Item",
+			filters={"variant_of": template_item.name},
+			fields=["name"]
+		)
+		
+		# Look for the first variant that has this attribute
+		for variant in variants:
+			try:
+				variant_doc = frappe.get_doc("Item", variant.name)
+				if variant_doc.attributes:
+					# Find the attribute by name
+					for attr in variant_doc.attributes:
+						if attr.attribute == attribute_name:
+							return attr.attribute_value
+					
+					# Fallback: try by index
+					if index < len(variant_doc.attributes):
+						return variant_doc.attributes[index].attribute_value
+			except Exception:
+				continue
+		
+		# If no variant has this attribute, try to get a default from the attribute values
+		try:
+			attr_values = frappe.db.get_all(
+				"Item Attribute Value", 
+				{"parent": attribute_name}, 
+				pluck="attribute_value"
+			)
+			if attr_values:
+				return attr_values[0]  # Return the first available value
+		except Exception:
+			pass
+		
+		return None
+	except (Exception, AttributeError):
+		return None
 
 
 def add_or_update_variant(new_variant: Variant, variants: List[Variant]):
@@ -493,40 +595,175 @@ def map_erpnext_variant_to_shopify_variant(
 
 
 
+# Cache to store recently fetched collections to avoid repeated API calls
+_collection_cache = {}
+_cache_timestamp = None
+CACHE_DURATION = 300  # 5 minutes
+
+def clear_collection_cache():
+	"""Clear the collection cache to force fresh data fetch."""
+	global _collection_cache, _cache_timestamp
+	_collection_cache = {}
+	_cache_timestamp = None
+	create_shopify_log(message="Collection cache cleared")
+
+@temp_shopify_session
+def get_collection_by_title(title):
+	"""Get a specific collection by title using direct search."""
+	try:
+		collections = CustomCollection.find(title=title)
+		if collections:
+			create_shopify_log(message=f"Found collection '{title}' (ID: {collections[0].id})")
+			return collections[0]
+		else:
+			create_shopify_log(message=f"No collection found with title '{title}'")
+			return None
+	except Exception as e:
+		create_shopify_log(message=f"Error searching for collection '{title}': {str(e)}", error=True)
+		return None
+
+@temp_shopify_session
+def find_collection_case_insensitive(target_title):
+	"""Find collection with case-insensitive matching."""
+	try:
+		all_collections = CustomCollection.find()
+		if all_collections:
+			for col in all_collections:
+				if hasattr(col, 'title') and col.title:
+					col_title = col.title.strip()
+					if col_title.lower() == target_title.lower():
+						create_shopify_log(message=f"Found collection (case-insensitive): '{col_title}' (ID: {col.id})")
+						return col
+		return None
+	except Exception as e:
+		create_shopify_log(message=f"Error in case-insensitive search for '{target_title}': {str(e)}", error=True)
+		return None
+
 #update by abbass
+@temp_shopify_session
 def get_or_create_shopify_collection(title: str) -> Optional[int]:
 	"""Fetch or create a Shopify CustomCollection by title."""
-	collections = CustomCollection.find()
-	for col in collections:
-		if col.title.strip().lower() == title.strip().lower():
-			return col.id
+	if not title or not title.strip():
+		create_shopify_log(message="Empty collection title provided", error=True)
+		return None
+	
+	# Normalize the title for comparison
+	normalized_title = title.strip()
+	
+	# Check cache first
+	import time
+	global _collection_cache, _cache_timestamp
+	
+	current_time = time.time()
+	if (_cache_timestamp is None or current_time - _cache_timestamp > CACHE_DURATION):
+		_collection_cache = {}
+		_cache_timestamp = current_time
+		create_shopify_log(message="Collection cache expired, fetching fresh data")
+	
+	# Check if we have this collection in cache
+	if normalized_title.lower() in _collection_cache:
+		cached_id = _collection_cache[normalized_title.lower()]
+		create_shopify_log(message=f"Found collection '{normalized_title}' in cache (ID: {cached_id})")
+		return cached_id
+	
+	try:
+		# Search for existing collection by title (case-sensitive search first)
+		existing_collection = get_collection_by_title(normalized_title)
+		if existing_collection:
+			# Store in cache for future use
+			_collection_cache[normalized_title.lower()] = existing_collection.id
+			create_shopify_log(message=f"Found existing collection: {existing_collection.title} (ID: {existing_collection.id})")
+			return existing_collection.id
+		
+		# If not found with exact match, try case-insensitive search
+		create_shopify_log(message=f"No exact match found for '{normalized_title}', trying case-insensitive search")
+		existing_collection = find_collection_case_insensitive(normalized_title)
+		if existing_collection:
+			# Store in cache for future use
+			_collection_cache[normalized_title.lower()] = existing_collection.id
+			create_shopify_log(message=f"Found existing collection (case-insensitive): {existing_collection.title} (ID: {existing_collection.id})")
+			return existing_collection.id
+		
+		create_shopify_log(message=f"No existing collection found for '{normalized_title}', creating new one")
 
-    # Create if not found
-	collection = CustomCollection()
-	collection.title = title
-	collection.published = True
-	if collection.save():
-		return collection.id
-	else:
-		create_shopify_log("Failed to create collection", error=True)
+		# Create new collection if not found
+		collection = CustomCollection()
+		collection.title = normalized_title
+		collection.published = True
+		
+		try:
+			if collection.save():
+				# Store in cache for future use
+				_collection_cache[normalized_title.lower()] = collection.id
+				create_shopify_log(message=f"Successfully created new collection: {normalized_title} (ID: {collection.id})")
+				return collection.id
+			else:
+				error_msg = "Unknown error"
+				if hasattr(collection, 'errors') and collection.errors:
+					error_msg = collection.errors.full_messages()
+				create_shopify_log(message=f"Failed to create collection '{normalized_title}': {error_msg}", error=True)
+				return None
+		except Exception as save_error:
+			create_shopify_log(message=f"Exception during collection save for '{normalized_title}': {str(save_error)}", error=True)
+			return None
+			
+	except Exception as e:
+		create_shopify_log(message=f"Error in get_or_create_shopify_collection for '{normalized_title}': {str(e)}", error=True)
 		return None
 
 
+@temp_shopify_session
 def link_product_to_collections(product_id: int, collection_titles: List[str]):
-	for title in collection_titles:
+	"""Link a product to multiple collections, avoiding duplicates."""
+	if not collection_titles:
+		return
+		
+	# Remove duplicates and empty titles
+	unique_titles = list(set([title.strip() for title in collection_titles if title and title.strip()]))
+	
+	if not unique_titles:
+		create_shopify_log(message="No valid collection titles provided for linking")
+		return
+	
+	create_shopify_log(message=f"Linking product {product_id} to collections: {unique_titles}")
+	
+	for title in unique_titles:
 		collection_id = get_or_create_shopify_collection(title)
 		if not collection_id:
+			create_shopify_log(message=f"Failed to get/create collection '{title}', skipping link", error=True)
 			continue
 
-		existing = Collect.find(product_id=product_id, collection_id=collection_id)
-		if not existing:
+		try:
+			# Check if the product is already linked to this collection
+			existing_collects = []
+			try:
+				existing_collects = Collect.find(product_id=product_id, collection_id=collection_id)
+			except Exception as find_error:
+				create_shopify_log(message=f"Error checking existing collects for product {product_id}, collection {collection_id}: {str(find_error)}", error=True)
+				# Continue with creation attempt even if we can't check existing links
+			
+			if existing_collects:
+				create_shopify_log(message=f"Product {product_id} already linked to collection '{title}' (ID: {collection_id})")
+				continue
+				
+			# Create new collect link
 			collect = Collect()
 			collect.product_id = product_id
 			collect.collection_id = collection_id
+			
 			try:
-				collect.save()
-			except Exception as e:
-				create_shopify_log(f"Failed to link product to collection {title}: {e}", error=True)
+				if collect.save():
+					create_shopify_log(message=f"Successfully linked product {product_id} to collection '{title}' (ID: {collection_id})")
+				else:
+					error_msg = "Unknown error"
+					if hasattr(collect, 'errors') and collect.errors:
+						error_msg = collect.errors.full_messages()
+					create_shopify_log(message=f"Failed to save collect link for product {product_id} to collection '{title}': {error_msg}", error=True)
+			except Exception as save_error:
+				create_shopify_log(message=f"Exception during collect save for product {product_id} to collection '{title}': {str(save_error)}", error=True)
+				
+		except Exception as e:
+			create_shopify_log(message=f"Failed to link product {product_id} to collection '{title}': {str(e)}", error=True)
 
 
 def get_all_parent_groups(item_group: str) -> List[str]:
@@ -543,23 +780,32 @@ def get_all_parent_groups(item_group: str) -> List[str]:
 
 
 def sync_collections_from_erp_item(product_id: int, erpnext_item):
-
+	"""Sync collections from ERPNext item to Shopify, avoiding duplicates."""
 	collections = []
+	
+	# Add item group and its parent groups
 	if erpnext_item.item_group:
 		collections.append(erpnext_item.item_group)
-
 		parent_groups = get_all_parent_groups(erpnext_item.item_group)
 		collections.extend(parent_groups)
 
+	# Add gender if it exists
 	gender = getattr(erpnext_item, "gender", None)
-	if gender:
-		collections.append(gender)
+	if gender and gender.strip():
+		collections.append(gender.strip())
 
+	# Remove duplicates and empty values
+	collections = list(set([col.strip() for col in collections if col and col.strip()]))
+	
 	if collections:
+		create_shopify_log(message=f"Syncing collections for product {product_id}: {collections}")
 		link_product_to_collections(product_id, collections)
+	else:
+		create_shopify_log(message=f"No collections to sync for product {product_id}")
 
 
 
+@temp_shopify_session
 def unlink_collections_from_product(product_id: int):
 	try:
 		collects = Collect.find(product_id=product_id)
@@ -572,6 +818,38 @@ def unlink_collections_from_product(product_id: int):
 
 	except Exception as e:
 		frappe.log_error(f"Failed to fetch collects for product {product_id}: {e}", "Shopify Sync Error")
+
+
+def test_collection_functions():
+	"""Test function to debug collection creation and linking issues."""
+	try:
+		create_shopify_log(message="Testing collection functions...")
+		
+		# Test 1: Try direct search for existing collection
+		test_title = "Test Collection"
+		existing = get_collection_by_title(test_title)
+		if existing:
+			create_shopify_log(message=f"Found existing collection: {existing.title} (ID: {existing.id})")
+		else:
+			create_shopify_log(message=f"No existing collection found for '{test_title}'")
+		
+		# Test 2: Try to create/find a test collection
+		test_collection_id = get_or_create_shopify_collection(test_title)
+		if test_collection_id:
+			create_shopify_log(message=f"Successfully created/found test collection with ID: {test_collection_id}")
+		else:
+			create_shopify_log(message="Failed to create/find test collection", error=True)
+		
+		# Test 3: Test cache functionality
+		create_shopify_log(message="Testing cache functionality...")
+		cached_id = get_or_create_shopify_collection(test_title)
+		if cached_id:
+			create_shopify_log(message=f"Cache test successful - found collection ID: {cached_id}")
+		else:
+			create_shopify_log(message="Cache test failed", error=True)
+			
+	except Exception as e:
+		create_shopify_log(message=f"Error in test_collection_functions: {str(e)}", error=True)
 
 
 
