@@ -7,6 +7,7 @@ from typing import List
 
 import frappe
 from frappe import _
+from pyactiveresource.connection import ClientError
 from shopify.resources import Webhook
 from shopify.session import Session
 
@@ -33,8 +34,44 @@ def temp_shopify_session(func):
 		if setting.is_enabled():
 			auth_details = (setting.shopify_url, API_VERSION, setting.get_password("password"))
 
-			with Session.temp(*auth_details):
-				return func(*args, **kwargs)
+			try:
+				with Session.temp(*auth_details):
+					return func(*args, **kwargs)
+			except ClientError as e:
+				# Handle 402 Payment Required / Unavailable Shop error
+				if hasattr(e, 'response') and e.response.code == 402:
+					error_body = {}
+					try:
+						import json as json_lib
+						if hasattr(e.response, 'body') and e.response.body:
+							error_body = json_lib.loads(e.response.body.decode('utf-8') if isinstance(e.response.body, bytes) else e.response.body)
+					except:
+						pass
+					
+					error_message = error_body.get('errors', 'Unavailable Shop')
+					if isinstance(error_message, dict):
+						error_message = str(error_message)
+					
+					user_message = _(
+						"Shopify shop is unavailable. This usually means:\n"
+						"• The shop subscription has expired\n"
+						"• The shop account has payment issues\n"
+						"• The shop has been paused or closed\n\n"
+						"Please check your Shopify account status and ensure your subscription is active.\n\n"
+						"Error details: {0}"
+					).format(error_message)
+					
+					create_shopify_log(
+						status="Error",
+						exception=str(e),
+						message=user_message,
+						method=func.__name__
+					)
+					
+					frappe.throw(user_message, title=_("Shopify Shop Unavailable"))
+				
+				# Re-raise other ClientError exceptions
+				raise
 
 	return wrapper
 
@@ -46,16 +83,49 @@ def register_webhooks(shopify_url: str, password: str) -> List[Webhook]:
 	# clear all stale webhooks matching current site url before registering new ones
 	unregister_webhooks(shopify_url, password)
 
-	with Session.temp(shopify_url, API_VERSION, password):
-		for topic in WEBHOOK_EVENTS:
-			webhook = Webhook.create({"topic": topic, "address": get_callback_url(), "format": "json"})
+	try:
+		with Session.temp(shopify_url, API_VERSION, password):
+			for topic in WEBHOOK_EVENTS:
+				webhook = Webhook.create({"topic": topic, "address": get_callback_url(), "format": "json"})
 
-			if webhook.is_valid():
-				new_webhooks.append(webhook)
-			else:
-				create_shopify_log(
-					status="Error", response_data=webhook.to_dict(), exception=webhook.errors.full_messages(),
-				)
+				if webhook.is_valid():
+					new_webhooks.append(webhook)
+				else:
+					create_shopify_log(
+						status="Error", response_data=webhook.to_dict(), exception=webhook.errors.full_messages(),
+					)
+	except ClientError as e:
+		if hasattr(e, 'response') and e.response.code == 402:
+			error_body = {}
+			try:
+				import json as json_lib
+				if hasattr(e.response, 'body') and e.response.body:
+					error_body = json_lib.loads(e.response.body.decode('utf-8') if isinstance(e.response.body, bytes) else e.response.body)
+			except:
+				pass
+			
+			error_message = error_body.get('errors', 'Unavailable Shop')
+			if isinstance(error_message, dict):
+				error_message = str(error_message)
+			
+			user_message = _(
+				"Shopify shop is unavailable. This usually means:\n"
+				"• The shop subscription has expired\n"
+				"• The shop account has payment issues\n"
+				"• The shop has been paused or closed\n\n"
+				"Please check your Shopify account status and ensure your subscription is active.\n\n"
+				"Error details: {0}"
+			).format(error_message)
+			
+			create_shopify_log(
+				status="Error",
+				exception=str(e),
+				message=user_message,
+				method="register_webhooks"
+			)
+			
+			frappe.throw(user_message, title=_("Shopify Shop Unavailable"))
+		raise
 
 	return new_webhooks
 
@@ -64,11 +134,22 @@ def unregister_webhooks(shopify_url: str, password: str) -> None:
 	"""Unregister all webhooks from shopify that correspond to current site url."""
 	url = get_current_domain_name()
 
-	with Session.temp(shopify_url, API_VERSION, password):
-
-		for webhook in Webhook.find():
-			if url in webhook.address:
-				webhook.destroy()
+	try:
+		with Session.temp(shopify_url, API_VERSION, password):
+			for webhook in Webhook.find():
+				if url in webhook.address:
+					webhook.destroy()
+	except ClientError as e:
+		# Silently handle 402 errors during unregister (shop might be unavailable)
+		if hasattr(e, 'response') and e.response.code == 402:
+			create_shopify_log(
+				status="Error",
+				exception=str(e),
+				message="Shopify shop unavailable while unregistering webhooks",
+				method="unregister_webhooks"
+			)
+			return
+		raise
 
 
 def get_current_domain_name() -> str:
