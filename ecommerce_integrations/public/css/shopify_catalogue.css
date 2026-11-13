@@ -229,7 +229,20 @@ body.scat-page .scat { --navbar-height: 0px; }
 @keyframes scatFly { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: none; } }
 
 /* ------------------------------------------------------------------ main */
-.scat-main { min-width: 0; padding: 20px 24px 96px; display: flex; flex-direction: column; gap: 14px; }
+/* The page fills the window; only the table scrolls (header row pinned). The
+   main column scrolls as a whole only when the window is too short for it. */
+.scat-main {
+	min-width: 0;
+	height: calc(100vh - var(--navbar-height, 48px));
+	overflow-y: auto;
+	padding: 20px 24px 12px;
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+	transition: padding-bottom 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.scat-main > * { flex-shrink: 0; }
+.scat.has-selection .scat-main { padding-bottom: 76px; } /* room for the floating selection bar */
 .scat-head { display: flex; align-items: flex-start; gap: 16px; }
 .scat-head-text { flex: 1; min-width: 0; }
 .scat-title { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -0.015em; line-height: 1.25; color: var(--sc-text); }
@@ -307,7 +320,9 @@ body.scat-page .scat { --navbar-height: 0px; }
 
 /* table */
 .scat-card { background: var(--sc-surface); border: 1px solid var(--sc-line); border-radius: var(--sc-r); box-shadow: var(--sc-shadow); overflow: hidden; }
-.scat-table-wrap { overflow-x: auto; }
+.scat-main > .scat-card { flex: 1 1 auto; min-height: 260px; display: flex; flex-direction: column; }
+.scat-table-wrap { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.scat-foot-bar { flex-shrink: 0; }
 .scat-table { width: 100%; border-collapse: separate; border-spacing: 0; min-width: 820px; }
 .scat-table th {
 	position: sticky;
@@ -446,7 +461,7 @@ body.scat-page .scat { --navbar-height: 0px; }
 	.scat .scat-brand-text, .scat .scat-link-label, .scat .scat-count, .scat .scat-group-label, .scat .scat-caret, .scat .scat-fresh-text, .scat .scat-hide-rail { display: none; }
 	.scat .scat-group-icon { display: grid; place-items: center; }
 	.scat .scat-group .scat-group-kids { display: none; }
-	.scat-main { padding: 16px 16px 96px; }
+	.scat-main { padding: 16px 16px 12px; }
 	.scat-head { flex-direction: column; }
 }
 @media (prefers-reduced-motion: reduce) {

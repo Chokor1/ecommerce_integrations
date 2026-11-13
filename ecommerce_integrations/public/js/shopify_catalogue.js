@@ -422,6 +422,7 @@ frappe.provide("shopify");
 					this.page_length = message.page_length;
 					this.render_counts();
 					this.render_rows();
+					this.$main.find(".scat-table-wrap").scrollTop(0);
 					this.render_pager();
 					this.render_selbar();
 				});
@@ -430,7 +431,7 @@ frappe.provide("shopify");
 		go(start) {
 			this.start = Math.max(0, start);
 			this.load();
-			this.$main.find(".scat-table-wrap")[0].scrollIntoView({ block: "nearest" });
+			this.$main.find(".scat-table-wrap").scrollTop(0);
 		}
 
 		set_bucket(bucket) {
@@ -752,6 +753,7 @@ frappe.provide("shopify");
 		render_selbar() {
 			const action = ACTIONS[BUCKETS[this.bucket].action];
 			const n = this.all_matching ? this.total : this.selected.size;
+			this.$root.toggleClass("has-selection", !!n);
 			if (!n) {
 				this.$selbar.attr("hidden", true).empty();
 				return;
