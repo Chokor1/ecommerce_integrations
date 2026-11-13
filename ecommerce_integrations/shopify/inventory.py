@@ -71,6 +71,14 @@ def upload_inventory_data_to_shopify(inventory_levels, warehous_map) -> None:
 	synced_on = now()
 	# one item has a row per mapped warehouse: look its inventory id up once
 	inventory_ids = {}
+	# a disabled item must stay unsellable: always send 0 for it (F12)
+	disabled_items = set(
+		frappe.get_all(
+			"Item",
+			filters={"name": ["in", list({d.item_code for d in inventory_levels})], "disabled": 1},
+			pluck="name",
+		)
+	)
 
 	for inventory_sync_batch in create_batch(inventory_levels, 50):
 		for d in inventory_sync_batch:
@@ -84,7 +92,9 @@ def upload_inventory_data_to_shopify(inventory_levels, warehous_map) -> None:
 					location_id=d.shopify_location_id,
 					inventory_item_id=inventory_id,
 					# shopify doesn't support fractional quantity
-					available=cint(d.actual_qty) - cint(d.reserved_qty),
+					available=0
+					if d.item_code in disabled_items
+					else cint(d.actual_qty) - cint(d.reserved_qty),
 				)
 				update_inventory_sync_status(d.ecom_item, time=synced_on)
 				d.status = "Success"

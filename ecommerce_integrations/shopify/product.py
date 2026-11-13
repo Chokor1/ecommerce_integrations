@@ -5,10 +5,10 @@ from typing import Optional, List
 
 import frappe
 from frappe import _, msgprint
-from frappe.utils import cint, cstr, strip_html
+from frappe.utils import cint, cstr, flt, strip_html
 from frappe.utils.nestedset import get_root_of
 from shopify.collection import PaginatedIterator
-from shopify.resources import Collect, CustomCollection, Product, Shop, Variant
+from shopify.resources import Collect, CustomCollection, InventoryLevel, Product, Shop, Variant
 
 from ecommerce_integrations.ecommerce_integrations.doctype.ecommerce_item import ecommerce_item
 from ecommerce_integrations.shopify.connection import temp_shopify_session
@@ -337,9 +337,17 @@ def upload_erpnext_item(doc, method=None):
 	if not has_shopify_changes(doc) and _is_linked(doc.name):
 		return
 
+	disabled_changed = bool(doc.get_doc_before_save()) and doc.has_value_changed("disabled")
+	if disabled_changed:
+		# the stock sync re-sends this item's levels (0 while disabled), even if
+		# the upload below fails (F12)
+		_mark_stock_for_resync(doc.name)
+
 	frappe.flags.in_shopify_item_upload = True
 	try:
-		uploaded = _upload_erpnext_item(doc, sync_collections=_collections_changed(doc))
+		uploaded = _upload_erpnext_item(
+			doc, sync_collections=_collections_changed(doc), push_stock=disabled_changed
+		)
 	except Exception as e:
 		if _is_database_error(e):
 			raise
@@ -392,6 +400,16 @@ def _collections_changed(doc) -> bool:
 	return doc.has_value_changed("item_group") or doc.has_value_changed("gender")
 
 
+def _mark_stock_for_resync(item_code: str) -> None:
+	frappe.db.set_value(
+		"Ecommerce Item",
+		{"erpnext_item_code": item_code, "integration": MODULE_NAME},
+		"inventory_synced_on",
+		"2000-01-01 00:00:00",
+		update_modified=False,
+	)
+
+
 def _is_linked(item_code: str) -> bool:
 	return bool(
 		frappe.db.exists("Ecommerce Item", {"erpnext_item_code": item_code, "integration": MODULE_NAME})
@@ -399,12 +417,13 @@ def _is_linked(item_code: str) -> bool:
 
 
 @temp_shopify_session
-def _upload_erpnext_item(doc, sync_collections=True):
+def _upload_erpnext_item(doc, sync_collections=True, push_stock=False):
 	"""Push the item to Shopify. Returns True when something was sent.
 
 	Collections are only synced when `sync_collections` (Item Group or Gender
-	changed, a new product, or a retry). Raises on any Shopify failure;
-	callers decide whether to retry."""
+	changed, a new product, or a retry). `push_stock` re-sends the variant's
+	stock now (the item was just enabled or disabled). Raises on any Shopify
+	failure; callers decide whether to retry."""
 	template_item = item = doc  # alias for readability
 
 	setting = frappe.get_doc(SETTING_DOCTYPE)
@@ -413,7 +432,7 @@ def _upload_erpnext_item(doc, sync_collections=True):
 		return False
 
 	if item.has_variants:
-		return False
+		return _update_template_product(item, setting, sync_collections)
 
 	if len(item.attributes) > 3:
 		msgprint(_("Template items/Items with 4 or more attributes can not be uploaded to Shopify."))
@@ -453,30 +472,14 @@ def _upload_erpnext_item(doc, sync_collections=True):
 			sku=template_item.item_code,
 			price=template_item.get(ITEM_SELLING_RATE_FIELD) or 0,
 			is_stock_item=template_item.is_stock_item,
+			item=template_item,
 		)
 		if item.variant_of:
 			product.options = []
 			product.variants = []
-			variant_attributes = {
-				"title": template_item.item_name,
-				"sku": item.item_code,
-				"price": item.get(ITEM_SELLING_RATE_FIELD) or 0,
-			}
-			max_index_range = min(3, len(template_item.attributes))
-			for i in range(0, max_index_range):
-				attr = template_item.attributes[i]
-				product.options.append(
-					{
-						"name": attr.attribute,
-						"values": frappe.db.get_all(
-							"Item Attribute Value", {"parent": attr.attribute}, pluck="attribute_value"
-						),
-					}
-				)
-
-			# Map variant attributes to options using the new intelligent mapping
-			option_attributes = _map_variant_attributes_to_options(item, template_item)
-			variant_attributes.update(option_attributes)
+			variant_attributes = _variant_attributes(item, template_item)
+			variant_attributes["title"] = template_item.item_name
+			product.options = _product_options(template_item, variant_attributes)
 
 			add_or_update_variant(Variant(variant_attributes), product.variants)
 
@@ -486,6 +489,7 @@ def _upload_erpnext_item(doc, sync_collections=True):
 			_insert_ecommerce_item(item, product, product.variants[0])
 
 		sync_collections_from_erp_item(product.id, template_item)
+		_sync_variant_availability(product, item, setting, push_stock)
 		write_upload_log(status=True, product=product, item=item)
 		return True
 
@@ -499,30 +503,17 @@ def _upload_erpnext_item(doc, sync_collections=True):
 	map_erpnext_item_to_shopify(shopify_product=product, erpnext_item=template_item)
 	if not item.variant_of:
 		update_default_variant_properties(
-			product, is_stock_item=template_item.is_stock_item, price=item.get(ITEM_SELLING_RATE_FIELD) or 0
+			product,
+			is_stock_item=template_item.is_stock_item,
+			price=item.get(ITEM_SELLING_RATE_FIELD) or 0,
+			item=item,
 		)
 		# a product created by an interrupted first upload has no SKU yet
 		if not product.variants[0].sku:
 			product.variants[0].sku = item.item_code
 	else:
-		variant_attributes = {"sku": item.item_code, "price": item.get(ITEM_SELLING_RATE_FIELD) or 0}
-		product.options = []
-		max_index_range = min(3, len(template_item.attributes))
-		for i in range(0, max_index_range):
-			attr = template_item.attributes[i]
-			product.options.append(
-				{
-					"name": attr.attribute,
-					"values": frappe.db.get_all(
-						"Item Attribute Value", {"parent": attr.attribute}, pluck="attribute_value"
-					),
-				}
-			)
-
-		# Map variant attributes to options using the new intelligent mapping
-		option_attributes = _map_variant_attributes_to_options(item, template_item)
-		variant_attributes.update(option_attributes)
-
+		variant_attributes = _variant_attributes(item, template_item)
+		product.options = _product_options(template_item, variant_attributes)
 		add_or_update_variant(Variant(variant_attributes), product.variants)
 
 	_save_product(product)
@@ -530,9 +521,114 @@ def _upload_erpnext_item(doc, sync_collections=True):
 		sync_collections_from_erp_item(product.id, template_item)
 	if item.variant_of:
 		map_erpnext_variant_to_shopify_variant(product, item, variant_attributes)
+	_sync_variant_availability(product, item, setting, push_stock)
 
 	write_upload_log(status=True, product=product, item=item, action="Updated")
 	return True
+
+
+def _update_template_product(template, setting, sync_collections: bool) -> bool:
+	"""A template's own save: push the product-level fields (title,
+	description, type, status, collections), never its variants (F14)."""
+	if not setting.update_shopify_item_on_update:
+		return False
+
+	product_id = frappe.db.get_value(
+		"Ecommerce Item",
+		{"erpnext_item_code": template.name, "integration": MODULE_NAME},
+		"integration_item_code",
+	)
+	if not product_id:
+		return False  # not in Shopify yet: its first variant creates the product
+
+	product = Product.find(product_id)
+	if not product:
+		return False
+
+	map_erpnext_item_to_shopify(shopify_product=product, erpnext_item=template)
+	_save_product(product)
+	if sync_collections:
+		sync_collections_from_erp_item(product.id, template)
+	write_upload_log(status=True, product=product, item=template, action="Updated")
+	return True
+
+
+def _variant_attributes(item, template_item) -> dict:
+	attributes = {"sku": item.item_code, "price": item.get(ITEM_SELLING_RATE_FIELD) or 0}
+	attributes.update(_map_variant_attributes_to_options(item, template_item))
+	attributes.update(_weight_fields(item))
+	if item.disabled:
+		attributes["inventory_policy"] = "deny"  # no sales below 0 (F12)
+	return attributes
+
+
+def _product_options(template_item, variant_attributes: dict) -> list:
+	"""Option values the template's variants actually use, in the attribute's
+	own order, not every value of the attribute in the system (F15)."""
+	variants = frappe.get_all("Item", filters={"variant_of": template_item.name}, pluck="name")
+	options = []
+	for i, attr in enumerate(template_item.attributes[:3]):
+		used = set()
+		if variants:
+			used = set(
+				frappe.get_all(
+					"Item Variant Attribute",
+					filters={"parent": ["in", variants], "attribute": attr.attribute},
+					pluck="attribute_value",
+				)
+			)
+		own = variant_attributes.get(f"option{i + 1}")
+		if own:
+			used.add(own)
+		used.discard(None)
+		used.discard("")
+
+		ordered = [
+			v
+			for v in frappe.get_all(
+				"Item Attribute Value", filters={"parent": attr.attribute}, pluck="attribute_value", order_by="idx asc"
+			)
+			if v in used
+		]
+		ordered += sorted(used - set(ordered), key=cstr)  # e.g. numeric attributes
+		options.append({"name": attr.attribute, "values": ordered})
+	return options
+
+
+def _weight_fields(item) -> dict:
+	"""Shopify keeps weight on the variant, not the product (F19)."""
+	uom = get_shopify_weight_uom(item.weight_uom) if item.get("weight_uom") else None
+	if uom and flt(item.get("weight_per_unit")) > 0:
+		return {"weight": flt(item.weight_per_unit), "weight_unit": uom}
+	return {}
+
+
+def _sync_variant_availability(product: Product, item, setting, push_stock: bool) -> None:
+	"""A disabled variant stops selling at once: stock 0 at every mapped
+	location. When it is enabled again its real stock is sent back (F12)."""
+	if not item.is_stock_item or not (item.disabled or push_stock):
+		return
+
+	variant = next((v for v in product.variants if getattr(v, "sku", None) == item.item_code), None)
+	if not variant or getattr(variant, "inventory_management", None) != "shopify":
+		return
+
+	from ecommerce_integrations.shopify.inventory import _call_shopify
+
+	for warehouse, location_id in setting.get_erpnext_to_integration_wh_mapping().items():
+		available = 0
+		if not item.disabled:
+			bin_qty = frappe.db.get_value(
+				"Bin", {"item_code": item.item_code, "warehouse": warehouse}, ["actual_qty", "reserved_qty"], as_dict=1
+			)
+			if bin_qty:
+				available = cint(bin_qty.actual_qty) - cint(bin_qty.reserved_qty)
+		_call_shopify(
+			InventoryLevel.set,
+			location_id=location_id,
+			inventory_item_id=variant.inventory_item_id,
+			available=available,
+		)
 
 
 def _save_product(product: Product) -> None:
@@ -856,11 +952,31 @@ def add_or_update_variant(new_variant: Variant, variants: List[Variant]):
 	# variants (e.g. added in Shopify) and Shopify deletes any variant missing
 	# from a product save (F4).
 	variants[:] = [v for v in variants if getattr(v, "option1", "") != "Default Title"]
-	for variant in variants:
-		if variant.sku == new_variant.sku:
-			variant.price = new_variant.price 
-			return  
-	variants.append(new_variant)
+
+	match = next((v for v in variants if getattr(v, "sku", None) == new_variant.sku), None)
+	if not match:
+		# same sizes/colours under another or no SKU: take that variant over
+		# instead of adding a duplicate ("variant already exists", F15)
+		combination = _option_combination(new_variant)
+		match = next((v for v in variants if _option_combination(v) == combination), None)
+		if match:
+			match.sku = new_variant.sku
+
+	if not match:
+		variants.append(new_variant)
+		return
+
+	for field in VARIANT_UPDATE_FIELDS:
+		value = getattr(new_variant, field, None)
+		if value is not None:
+			setattr(match, field, value)
+
+
+VARIANT_UPDATE_FIELDS = ("price", "weight", "weight_unit", "inventory_policy")
+
+
+def _option_combination(variant) -> tuple:
+	return tuple(cstr(getattr(variant, f"option{i}", None) or "").strip().lower() for i in (1, 2, 3))
 
 
 def map_erpnext_variant_to_shopify_variant(
@@ -1075,16 +1191,26 @@ def map_erpnext_item_to_shopify(shopify_product: Product, erpnext_item):
 
 		
 
-	if erpnext_item.weight_uom in WEIGHT_TO_ERPNEXT_UOM_MAP.values():
-		# reverse lookup for key
-		uom = get_shopify_weight_uom(erpnext_weight_uom=erpnext_item.weight_uom)
-		shopify_product.weight = erpnext_item.weight_per_unit
-		shopify_product.weight_unit = uom
+	# Weight lives on the variant in Shopify: see _weight_fields (F19).
 
+	# Disabled -> Draft, tagged so that enabling it again can bring back
+	# exactly the products this integration hid, and never a product someone
+	# set to Draft by hand (F13).
+	tags = [t.strip() for t in cstr(getattr(shopify_product, "tags", None) or "").split(",") if t.strip()]
 	if erpnext_item.disabled:
 		shopify_product.status = "draft"
 		shopify_product.published = False
+		if ERP_DISABLED_TAG not in tags:
+			shopify_product.tags = ", ".join(tags + [ERP_DISABLED_TAG])
 		msgprint(_("Status of linked Shopify product is changed to Draft."))
+	elif ERP_DISABLED_TAG in tags:
+		shopify_product.status = "active"
+		shopify_product.published = True
+		shopify_product.tags = ", ".join(t for t in tags if t != ERP_DISABLED_TAG)
+		msgprint(_("Linked Shopify product is active again."))
+
+
+ERP_DISABLED_TAG = "erp-disabled"
 
 
 def get_shopify_weight_uom(erpnext_weight_uom: str) -> str:
@@ -1098,6 +1224,7 @@ def update_default_variant_properties(
 	is_stock_item: bool,
 	sku: Optional[str] = None,
 	price: Optional[float] = None,
+	item=None,
 ):
 	"""Shopify creates default variant upon saving the product.
 
@@ -1114,6 +1241,11 @@ def update_default_variant_properties(
 		default_variant.price = price
 	if sku is not None:
 		default_variant.sku = sku
+	if item is not None:
+		for field, value in _weight_fields(item).items():
+			setattr(default_variant, field, value)
+		if item.disabled:
+			default_variant.inventory_policy = "deny"
 
 
 def write_upload_log(status: bool, product: Product, item, action="Created") -> None:
