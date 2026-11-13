@@ -1,10 +1,13 @@
+import json
+import socket
+import time
 from typing import Optional, List
 
 import frappe
 from frappe import _, msgprint
-from frappe.utils import cint, cstr
+from frappe.utils import cint, cstr, strip_html
 from frappe.utils.nestedset import get_root_of
-from shopify.resources import Product, Variant, CustomCollection, Collect
+from shopify.resources import Collect, CustomCollection, Product, Shop, Variant
 
 from ecommerce_integrations.ecommerce_integrations.doctype.ecommerce_item import ecommerce_item
 from ecommerce_integrations.shopify.connection import temp_shopify_session
@@ -305,36 +308,70 @@ def get_item_code(shopify_item):
 		return item.item_code
 
 
-@temp_shopify_session
+RETRY_METHOD = "ecommerce_integrations.shopify.product.retry_item_upload"
+MAX_RETRY_ATTEMPTS = 5
+
+
+class ShopifyUploadError(Exception):
+	"""Shopify refused to save the product (validation errors)."""
+
+
 def upload_erpnext_item(doc, method=None):
 	"""This hook is called when inserting new or updating existing `Item`.
 
 	New items are pushed to shopify and changes to existing items are
 	updated depending on what is configured in "Shopify Setting" doctype.
+
+	A Shopify failure never blocks the Item save (F2): the item is put on the
+	retry list and sent by `retry_pending_item_uploads` once Shopify answers.
 	"""
-	template_item = item = doc  # alias for readability
-	# a new item recieved from ecommerce_integrations is being inserted
-	if item.flags.from_integration:
+	if doc.flags.from_integration or frappe.flags.in_import:
 		return
+
+	frappe.flags.in_shopify_item_upload = True
+	try:
+		uploaded = _upload_erpnext_item(doc)
+	except Exception as e:
+		if _is_database_error(e):
+			raise
+		frappe.clear_last_message()  # drop the red dialog a frappe.throw() may have queued
+		_queue_item_retry(doc.name, e)
+		msgprint(
+			_("Saved, but not sent to Shopify: {0}<br>It will be sent automatically when Shopify is reachable.").format(
+				frappe.utils.escape_html(_short_error(e))
+			),
+			title=_("Shopify"),
+			indicator="orange",
+		)
+	else:
+		if uploaded:
+			_close_item_retry(doc.name, _("Sent on a later save of the item."))
+	finally:
+		frappe.flags.in_shopify_item_upload = False
+
+
+@temp_shopify_session
+def _upload_erpnext_item(doc):
+	"""Push the item to Shopify. Returns True when something was sent.
+
+	Raises on any Shopify failure; callers decide whether to retry."""
+	template_item = item = doc  # alias for readability
 
 	setting = frappe.get_doc(SETTING_DOCTYPE)
 
 	if not setting.is_enabled() or not setting.upload_erpnext_items:
-		return
-
-	if frappe.flags.in_import:
-		return
+		return False
 
 	if item.has_variants:
-		return
+		return False
 
 	if len(item.attributes) > 3:
 		msgprint(_("Template items/Items with 4 or more attributes can not be uploaded to Shopify."))
-		return
+		return False
 
 	if doc.variant_of and not setting.upload_variants_as_items:
 		msgprint(_("Enable variant sync in setting to upload item to Shopify."))
-		return
+		return False
 
 	if item.variant_of:
 		template_item = frappe.get_doc("Item", item.variant_of)
@@ -352,98 +389,316 @@ def upload_erpnext_item(doc, method=None):
 		product.status = "active" if setting.sync_new_item_as_active else "draft"
 
 		map_erpnext_item_to_shopify(shopify_product=product, erpnext_item=template_item)
-		is_successful = product.save()
+		_save_product(product)
 
-		if is_successful:
-			update_default_variant_properties(
-				product,
-				sku=template_item.item_code,
-				price=template_item.get(ITEM_SELLING_RATE_FIELD) or 0,
-				is_stock_item=template_item.is_stock_item,
-			)
-			if item.variant_of:
-				product.options = []
-				product.variants = []
-				variant_attributes = {
-					"title": template_item.item_name,
-					"sku": item.item_code,
-					"price": item.get(ITEM_SELLING_RATE_FIELD) or 0,
-				}
-				max_index_range = min(3, len(template_item.attributes))
-				for i in range(0, max_index_range):
-					attr = template_item.attributes[i]
-					product.options.append(
-						{
-							"name": attr.attribute,
-							"values": frappe.db.get_all(
-								"Item Attribute Value", {"parent": attr.attribute}, pluck="attribute_value"
-							),
-						}
-					)
-				
-				# Map variant attributes to options using the new intelligent mapping
-				option_attributes = _map_variant_attributes_to_options(item, template_item)
-				variant_attributes.update(option_attributes)
-				
-				add_or_update_variant(Variant(variant_attributes), product.variants)
+		# Link the product straight away: if a later step fails, the retry
+		# updates this product instead of creating a duplicate in Shopify.
+		if item.variant_of:
+			_insert_ecommerce_item(template_item, product)
+		else:
+			_insert_ecommerce_item(item, product, product.variants[0], sku=item.item_code)
 
-			product.save()  # push variant
-			sync_collections_from_erp_item(product.id, template_item)
-
-			ecom_items = list(set([item, template_item]))
-			for d in ecom_items:
-				ecom_item = frappe.get_doc(
+		update_default_variant_properties(
+			product,
+			sku=template_item.item_code,
+			price=template_item.get(ITEM_SELLING_RATE_FIELD) or 0,
+			is_stock_item=template_item.is_stock_item,
+		)
+		if item.variant_of:
+			product.options = []
+			product.variants = []
+			variant_attributes = {
+				"title": template_item.item_name,
+				"sku": item.item_code,
+				"price": item.get(ITEM_SELLING_RATE_FIELD) or 0,
+			}
+			max_index_range = min(3, len(template_item.attributes))
+			for i in range(0, max_index_range):
+				attr = template_item.attributes[i]
+				product.options.append(
 					{
-						"doctype": "Ecommerce Item",
-						"erpnext_item_code": d.name,
-						"integration": MODULE_NAME,
-						"integration_item_code": str(product.id),
-						"variant_id": "" if d.has_variants else str(product.variants[0].id),
-						"sku": "" if d.has_variants else str(product.variants[0].sku),
-						"has_variants": d.has_variants,
-						"variant_of": d.variant_of,
+						"name": attr.attribute,
+						"values": frappe.db.get_all(
+							"Item Attribute Value", {"parent": attr.attribute}, pluck="attribute_value"
+						),
 					}
 				)
-				ecom_item.insert()
 
-		write_upload_log(status=is_successful, product=product, item=item)
-	elif setting.update_shopify_item_on_update:
-		product = Product.find(product_id)
-		if product:
-			map_erpnext_item_to_shopify(shopify_product=product, erpnext_item=template_item)
-			if not item.variant_of:
-				update_default_variant_properties(
-					product, is_stock_item=template_item.is_stock_item, price=item.get(ITEM_SELLING_RATE_FIELD) or 0
-				)
-			else:
-				variant_attributes = {"sku": item.item_code, "price": item.get(ITEM_SELLING_RATE_FIELD) or 0}
-				product.options = []
-				max_index_range = min(3, len(template_item.attributes))
-				for i in range(0, max_index_range):
-					attr = template_item.attributes[i]
-					product.options.append(
-						{
-							"name": attr.attribute,
-							"values": frappe.db.get_all(
-								"Item Attribute Value", {"parent": attr.attribute}, pluck="attribute_value"
-							),
-						}
-					)
-				
-				# Map variant attributes to options using the new intelligent mapping
-				option_attributes = _map_variant_attributes_to_options(item, template_item)
-				variant_attributes.update(option_attributes)
-				
-				# product.variants.append(Variant(variant_attributes))
-				add_or_update_variant(Variant(variant_attributes), product.variants)
-			is_successful = product.save()
-			if is_successful:
-				unlink_collections_from_product(product.id)
-				sync_collections_from_erp_item(product.id, template_item)
-			if is_successful and item.variant_of:
-				map_erpnext_variant_to_shopify_variant(product, item, variant_attributes)
+			# Map variant attributes to options using the new intelligent mapping
+			option_attributes = _map_variant_attributes_to_options(item, template_item)
+			variant_attributes.update(option_attributes)
 
-			write_upload_log(status=is_successful, product=product, item=item, action="Updated")
+			add_or_update_variant(Variant(variant_attributes), product.variants)
+
+		_save_product(product)  # push variant
+
+		if item.variant_of:
+			_insert_ecommerce_item(item, product, product.variants[0])
+
+		sync_collections_from_erp_item(product.id, template_item)
+		write_upload_log(status=True, product=product, item=item)
+		return True
+
+	if not setting.update_shopify_item_on_update:
+		return False
+
+	product = Product.find(product_id)
+	if not product:
+		return False
+
+	map_erpnext_item_to_shopify(shopify_product=product, erpnext_item=template_item)
+	if not item.variant_of:
+		update_default_variant_properties(
+			product, is_stock_item=template_item.is_stock_item, price=item.get(ITEM_SELLING_RATE_FIELD) or 0
+		)
+		# a product created by an interrupted first upload has no SKU yet
+		if not product.variants[0].sku:
+			product.variants[0].sku = item.item_code
+	else:
+		variant_attributes = {"sku": item.item_code, "price": item.get(ITEM_SELLING_RATE_FIELD) or 0}
+		product.options = []
+		max_index_range = min(3, len(template_item.attributes))
+		for i in range(0, max_index_range):
+			attr = template_item.attributes[i]
+			product.options.append(
+				{
+					"name": attr.attribute,
+					"values": frappe.db.get_all(
+						"Item Attribute Value", {"parent": attr.attribute}, pluck="attribute_value"
+					),
+				}
+			)
+
+		# Map variant attributes to options using the new intelligent mapping
+		option_attributes = _map_variant_attributes_to_options(item, template_item)
+		variant_attributes.update(option_attributes)
+
+		add_or_update_variant(Variant(variant_attributes), product.variants)
+
+	_save_product(product)
+	unlink_collections_from_product(product.id)
+	sync_collections_from_erp_item(product.id, template_item)
+	if item.variant_of:
+		map_erpnext_variant_to_shopify_variant(product, item, variant_attributes)
+
+	write_upload_log(status=True, product=product, item=item, action="Updated")
+	return True
+
+
+def _save_product(product: Product) -> None:
+	if not product.save():
+		raise ShopifyUploadError(", ".join(product.errors.full_messages()) or "Unknown error")
+
+
+def _insert_ecommerce_item(erpnext_item, product: Product, variant: Optional[Variant] = None, sku=None):
+	frappe.get_doc(
+		{
+			"doctype": "Ecommerce Item",
+			"erpnext_item_code": erpnext_item.name,
+			"integration": MODULE_NAME,
+			"integration_item_code": str(product.id),
+			"variant_id": str(variant.id) if variant else "",
+			"sku": sku or (str(variant.sku or "") if variant else ""),
+			"has_variants": erpnext_item.has_variants,
+			"variant_of": erpnext_item.variant_of,
+		}
+	).insert()
+
+
+# ---------------------------------------------------------------------------
+# Retry list (F2): failed uploads are Ecommerce Integration Log rows with
+# method RETRY_METHOD, status "Error" and request_data {"item_code": ...}.
+# The log's Retry button re-runs them through the same function.
+# ---------------------------------------------------------------------------
+
+
+def _retry_request_data(item_code: str) -> str:
+	return json.dumps({"item_code": item_code})
+
+
+def _get_open_retry(item_code: str) -> Optional[str]:
+	return frappe.db.get_value(
+		"Ecommerce Integration Log",
+		{
+			"integration": MODULE_NAME,
+			"method": RETRY_METHOD,
+			"status": ["in", ["Error", "Queued"]],
+			"request_data": _retry_request_data(item_code),
+		},
+	)
+
+
+def _queue_item_retry(item_code: str, error: Exception) -> None:
+	"""Add the item to the retry list (one row per item), inside the save's own
+	transaction: no mid-save commit, and nothing is queued if the save fails."""
+	name = _get_open_retry(item_code)
+	log = (
+		frappe.get_doc("Ecommerce Integration Log", name)
+		if name
+		else frappe.get_doc(
+			{
+				"doctype": "Ecommerce Integration Log",
+				"integration": MODULE_NAME,
+				"method": RETRY_METHOD,
+				"request_data": _retry_request_data(item_code),
+				"response_data": json.dumps({"attempts": 0}),
+			}
+		)
+	)
+	log.status = "Error"
+	log.response_data = json.dumps({"attempts": 0})
+	log.message = _("Waiting to be sent to Shopify. Item {0}: {1}").format(item_code, _short_error(error))
+	log.traceback = frappe.get_traceback()
+	log.save(ignore_permissions=True)
+
+
+def _close_item_retry(item_code: str, message: str) -> None:
+	name = _get_open_retry(item_code)
+	if name:
+		frappe.db.set_value(
+			"Ecommerce Integration Log", name, {"status": "Success", "message": message, "traceback": ""}
+		)
+
+
+def _get_attempts(log) -> int:
+	try:
+		return cint(json.loads(log.response_data or "{}").get("attempts"))
+	except ValueError:
+		return 0
+
+
+def retry_item_upload(payload, request_id=None):
+	"""Send one waiting item. Used by the scheduler and the log's Retry button.
+
+	Returns False when Shopify itself is failing (stop sending more items)."""
+	if isinstance(payload, str):
+		payload = json.loads(payload)
+	item_code = payload.get("item_code")
+
+	log = frappe.get_doc("Ecommerce Integration Log", request_id) if request_id else None
+	if not log:
+		name = _get_open_retry(item_code)
+		log = frappe.get_doc("Ecommerce Integration Log", name) if name else None
+
+	if not frappe.db.exists("Item", item_code):
+		if log:
+			log.db_set({"status": "Invalid", "message": _("Item {0} no longer exists.").format(item_code)})
+		frappe.db.commit()
+		return True
+
+	previous_attempts = _get_attempts(log) if log else 0
+	attempts = previous_attempts + 1
+	frappe.flags.in_shopify_item_upload = True
+	try:
+		_upload_erpnext_item(frappe.get_doc("Item", item_code))
+	except Exception as e:
+		# Keep a product link saved before the failure, so the next try
+		# updates that product instead of creating a duplicate.
+		if _is_database_error(e):
+			frappe.db.rollback()
+		frappe.clear_last_message()
+		shop_wide = _is_shop_wide_error(e)
+		if shop_wide:
+			attempts = previous_attempts  # not this item's fault: don't use up a try
+		if log:
+			log.reload()
+			log.db_set(
+				{
+					"status": "Error",
+					"message": _("Waiting to be sent to Shopify (attempt {0} of {1}). Item {2}: {3}").format(
+						attempts, MAX_RETRY_ATTEMPTS, item_code, _short_error(e)
+					),
+					"traceback": frappe.get_traceback(),
+					"response_data": json.dumps({"attempts": attempts}),
+				}
+			)
+		return not shop_wide
+	else:
+		if log:
+			log.db_set(
+				{
+					"status": "Success",
+					"message": _("Sent to Shopify on retry (attempt {0}).").format(attempts),
+					"traceback": "",
+					"response_data": json.dumps({"attempts": attempts}),
+				}
+			)
+	finally:
+		frappe.flags.in_shopify_item_upload = False
+		frappe.db.commit()
+	return True
+
+
+def retry_pending_item_uploads():
+	"""Scheduler (every 30 min): send waiting items once Shopify is reachable."""
+	setting = frappe.get_doc(SETTING_DOCTYPE)
+	if not setting.is_enabled() or not setting.upload_erpnext_items:
+		return
+
+	pending = [
+		log
+		for log in frappe.get_all(
+			"Ecommerce Integration Log",
+			filters={"integration": MODULE_NAME, "method": RETRY_METHOD, "status": "Error"},
+			fields=["name", "request_data", "response_data"],
+			order_by="creation asc",
+		)
+		if _get_attempts(log) < MAX_RETRY_ATTEMPTS
+	]
+	if not pending or not _shopify_is_reachable():
+		return
+
+	for i, log in enumerate(pending):
+		if i:
+			time.sleep(1)  # Shopify allows about 2 calls per second
+		if not retry_item_upload(log.request_data, request_id=log.name):
+			break  # Shopify-wide problem: try the rest on the next run
+
+
+@temp_shopify_session
+def _check_shop():
+	Shop.current()
+
+
+def _shopify_is_reachable() -> bool:
+	"""One cheap call: an outage costs nothing and no item uses up an attempt."""
+	frappe.flags.in_shopify_item_upload = True  # the outage is expected here: no log row
+	try:
+		_check_shop()
+		return True
+	except Exception:
+		frappe.clear_last_message()
+		return False
+	finally:
+		frappe.flags.in_shopify_item_upload = False
+
+
+def _is_shop_wide_error(error: Exception) -> bool:
+	"""Outage, rate limit, auth or network problem, as opposed to Shopify
+	rejecting this particular item."""
+	from pyactiveresource import connection as conn
+
+	from ecommerce_integrations.shopify.connection import ShopifyShopUnavailable
+
+	if isinstance(error, (ShopifyShopUnavailable, conn.ServerError, socket.timeout, TimeoutError)):
+		return True
+	if isinstance(error, (conn.UnauthorizedAccess, conn.ForbiddenAccess)):
+		return True
+	if isinstance(error, conn.ClientError):
+		return cint(getattr(getattr(error, "response", None), "code", 0)) in (402, 423, 429)
+	# pyactiveresource raises the bare Error class for network failures
+	return type(error) in (conn.Error, conn.ConnectionError)
+
+
+def _is_database_error(error: Exception) -> bool:
+	import pymysql
+
+	return isinstance(error, pymysql.err.Error)
+
+
+def _short_error(error: Exception) -> str:
+	text = strip_html(cstr(error)).strip() or error.__class__.__name__
+	return text if len(text) <= 300 else text[:300] + "…"
 
 
 def _get_variant_attribute_value(item, attribute_name, index):
@@ -547,10 +802,10 @@ def _get_default_attribute_value_from_template(template_item, attribute_name, in
 
 
 def add_or_update_variant(new_variant: Variant, variants: List[Variant]):
-	variants[:] = [
-		v for v in variants
-		if not (getattr(v, "option1", "") == "Default Title" or getattr(v, "sku", "") == "")
-	]
+	# Drop only Shopify's placeholder variant. Variants without a SKU are real
+	# variants (e.g. added in Shopify) and Shopify deletes any variant missing
+	# from a product save (F4).
+	variants[:] = [v for v in variants if getattr(v, "option1", "") != "Default Title"]
 	for variant in variants:
 		if variant.sku == new_variant.sku:
 			variant.price = new_variant.price 

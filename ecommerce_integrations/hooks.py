@@ -155,6 +155,8 @@ scheduler_events = {
 	"weekly": [],
 	"monthly": [],
 	"cron": {
+		# Every thirty minutes: send items that failed to reach Shopify on save
+		"*/30 * * * *": ["ecommerce_integrations.shopify.product.retry_pending_item_uploads"],
 		# Every five minutes
 		"*/5 * * * *": [
 			"ecommerce_integrations.unicommerce.order.sync_new_orders",

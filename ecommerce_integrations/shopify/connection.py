@@ -20,6 +20,10 @@ from ecommerce_integrations.shopify.constants import (
 from ecommerce_integrations.shopify.utils import create_shopify_log
 
 
+class ShopifyShopUnavailable(frappe.ValidationError):
+	"""Shopify answered 402: the shop is paused, closed or unpaid."""
+
+
 def temp_shopify_session(func):
 	"""Any function that needs to access shopify api needs this decorator. The decorator starts a temp session that's destroyed when function returns."""
 
@@ -61,14 +65,17 @@ def temp_shopify_session(func):
 						"Error details: {0}"
 					).format(error_message)
 					
-					create_shopify_log(
-						status="Error",
-						exception=str(e),
-						message=user_message,
-						method=func.__name__
-					)
-					
-					frappe.throw(user_message, title=_("Shopify Shop Unavailable"))
+					# Item uploads put the item on the retry list instead; a log
+					# row here would also commit the Item save half-way.
+					if not frappe.flags.in_shopify_item_upload:
+						create_shopify_log(
+							status="Error",
+							exception=str(e),
+							message=user_message,
+							method=func.__name__
+						)
+
+					frappe.throw(user_message, exc=ShopifyShopUnavailable, title=_("Shopify Shop Unavailable"))
 				
 				# Re-raise other ClientError exceptions
 				raise
