@@ -136,7 +136,9 @@ doc_events = {
 
 scheduler_events = {
 	"all": ["ecommerce_integrations.shopify.inventory.update_inventory_on_shopify"],
-	"daily": [],
+	"daily": [
+		"ecommerce_integrations.ecommerce_integrations.doctype.ecommerce_integration_log.ecommerce_integration_log.clear_old_logs_by_retention"
+	],
 	"daily_long": [
 		"ecommerce_integrations.zenoti.doctype.zenoti_settings.zenoti_settings.sync_stocks"
 	],

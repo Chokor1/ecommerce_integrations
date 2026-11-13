@@ -6,8 +6,6 @@ import json
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.query_builder import Interval
-from frappe.query_builder.functions import Now
 from frappe.utils import strip_html
 from frappe.utils.data import cstr
 
@@ -30,11 +28,50 @@ class EcommerceIntegrationLog(Document):
 			self.title = title if len(title) < 100 else title[:100] + "..."
 
 	@staticmethod
-	def clear_old_logs(days=90):
-		table = frappe.qb.DocType("Ecommerce Integration Log")
-		frappe.db.delete(
-			table, filters=((table.modified < (Now() - Interval(days=days)))) & (table.status == "Success")
+	def clear_old_logs(days=None):
+		"""Called by Log Settings on Frappe v14+; v13 uses the daily hook below.
+
+		`days` is ignored: retention is per status (see RETENTION_RULES)."""
+		clear_old_logs_by_retention()
+
+
+# (description, SQL condition, days to keep). Rows still waiting to be processed
+# (status Queued with a method) are never deleted automatically.
+RETENTION_RULES = (
+	(
+		"Shopify info messages",
+		"integration = 'shopify' and status = 'Queued' and ifnull(method, '') = ''",
+		7,
+	),
+	("Success", "status = 'Success'", 30),
+	("Errors", "status in ('Error', 'Failed', 'Partial Success', 'Invalid')", 90),
+)
+
+DELETE_BATCH_SIZE = 10000
+
+
+def delete_logs_in_batches(condition: str, days: int = 0, batch_size: int = DELETE_BATCH_SIZE) -> int:
+	"""Delete matching logs older than `days`, committing after every batch so a
+	large cleanup never holds one long lock on production. Returns rows deleted."""
+	total = 0
+	while True:
+		frappe.db.sql(
+			f"""delete from `tabEcommerce Integration Log`
+			where {condition} and modified < now() - interval %(days)s day
+			limit %(batch)s""",
+			{"days": days, "batch": batch_size},
 		)
+		deleted = frappe.db._cursor.rowcount
+		frappe.db.commit()
+		total += deleted
+		if deleted < batch_size:
+			return total
+
+
+def clear_old_logs_by_retention() -> None:
+	"""Daily scheduler job (Frappe v13 Log Settings never calls clear_old_logs)."""
+	for _label, condition, days in RETENTION_RULES:
+		delete_logs_in_batches(condition, days)
 
 
 def create_log(
