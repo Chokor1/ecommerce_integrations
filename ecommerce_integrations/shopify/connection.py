@@ -8,6 +8,7 @@ from typing import List
 import frappe
 from frappe import _
 from pyactiveresource.connection import ClientError
+from shopify.api_version import ApiVersion, Release
 from shopify.resources import Webhook
 from shopify.session import Session
 
@@ -18,6 +19,11 @@ from ecommerce_integrations.shopify.constants import (
 	WEBHOOK_EVENTS,
 )
 from ecommerce_integrations.shopify.utils import create_shopify_log
+
+# ShopifyAPI 12.4 (the newest release for this Python) only knows versions up
+# to 2024-01; Session refuses any other unless it is registered first.
+if API_VERSION not in ApiVersion.versions:
+	ApiVersion.define_version(Release(API_VERSION))
 
 
 class ShopifyShopUnavailable(frappe.ValidationError):

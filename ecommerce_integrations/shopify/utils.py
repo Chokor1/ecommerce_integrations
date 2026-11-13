@@ -53,6 +53,12 @@ def _migrate_items_to_ecommerce_item(log):
 
 	for field in shopify_fields:
 		if not frappe.db.exists({"doctype": "Custom Field", "fieldname": field}):
+			# the old connector was never installed: nothing to migrate, ever.
+			# Record that, or every save of the settings queues this job again.
+			frappe.db.set_value(SETTING_DOCTYPE, SETTING_DOCTYPE, "is_old_data_migrated", 1)
+			log.status = "Success"
+			log.message = "Nothing to migrate: the old Shopify connector was not used on this site."
+			log.save(ignore_permissions=True)
 			return
 
 	items = _get_items_to_migrate()

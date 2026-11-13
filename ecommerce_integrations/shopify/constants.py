@@ -6,7 +6,10 @@ MODULE_NAME = "shopify"
 SETTING_DOCTYPE = "Shopify Setting"
 OLD_SETTINGS_DOCTYPE = "Shopify Settings"
 
-API_VERSION = "2024-01"
+# The version Shopify actually serves (2024-01 is retired and was silently
+# answered with 2026-01, F22). Before moving to a newer version, test the
+# integration against it; Shopify supports each version for about a year.
+API_VERSION = "2026-01"
 
 WEBHOOK_EVENTS = [
 	"orders/create",
