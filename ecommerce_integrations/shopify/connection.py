@@ -182,15 +182,28 @@ def get_callback_url() -> str:
 
 @frappe.whitelist(allow_guest=True)
 def store_request_data() -> None:
-	if frappe.request:
-		hmac_header = frappe.get_request_header("X-Shopify-Hmac-Sha256")
+	"""Shopify webhook endpoint. Bad requests get a clean 401/400 instead of
+	a server error, and unknown topics are acknowledged and ignored (F18)."""
+	if not frappe.request:
+		return
 
-		_validate_request(frappe.request, hmac_header)
+	hmac_header = frappe.get_request_header("X-Shopify-Hmac-Sha256")
+	if not hmac_header or not _is_valid_signature(frappe.request.data, hmac_header):
+		_webhook_logger().warning("Rejected webhook with missing or invalid signature")
+		return _reply(401, "Unverified Webhook Data")
 
+	event = frappe.get_request_header("X-Shopify-Topic")
+	if event not in EVENT_MAPPER:
+		# answer 200 so Shopify doesn't keep retrying a topic we don't handle
+		_webhook_logger().info(f"Ignored webhook topic {event!r}")
+		return _reply(200, "Ignored")
+
+	try:
 		data = json.loads(frappe.request.data)
-		event = frappe.request.headers.get("X-Shopify-Topic")
+	except ValueError:
+		return _reply(400, "Invalid JSON")
 
-		process_request(data, event)
+	process_request(data, event)
 
 
 def process_request(data, event):
@@ -208,12 +221,20 @@ def process_request(data, event):
 	)
 
 
-def _validate_request(req, hmac_header):
-	settings = frappe.get_doc(SETTING_DOCTYPE)
-	secret_key = settings.shared_secret
+def _is_valid_signature(body: bytes, hmac_header: str) -> bool:
+	secret_key = frappe.get_doc(SETTING_DOCTYPE).get_password("shared_secret", raise_exception=False)
+	if not secret_key:
+		return False
 
-	sig = base64.b64encode(hmac.new(secret_key.encode("utf8"), req.data, hashlib.sha256).digest())
+	sig = base64.b64encode(hmac.new(secret_key.encode("utf8"), body or b"", hashlib.sha256).digest())
+	return hmac.compare_digest(sig, hmac_header.encode())
 
-	if sig != bytes(hmac_header.encode()):
-		create_shopify_log(status="Error", request_data=req.data)
-		frappe.throw(_("Unverified Webhook Data"))
+
+def _reply(status_code: int, message: str) -> None:
+	frappe.local.response["http_status_code"] = status_code
+	frappe.local.response["message"] = message
+
+
+def _webhook_logger():
+	return frappe.logger("shopify_webhooks", allow_site=True)
+

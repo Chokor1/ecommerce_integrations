@@ -97,7 +97,7 @@
   },
   {
    "fieldname": "shared_secret",
-   "fieldtype": "Data",
+   "fieldtype": "Password",
    "label": "Shared secret / API Secret",
    "mandatory_depends_on": "eval:doc.enable_shopify"
   },
@@ -399,7 +399,7 @@
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2026-01-19 09:46:16.564137",
+ "modified": "2026-11-13 11:17:02.375023",
  "modified_by": "Administrator",
  "module": "shopify",
  "name": "Shopify Setting",
