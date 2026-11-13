@@ -116,11 +116,37 @@ def is_synced(product):
 	return ecommerce_item.is_synced(MODULE_NAME, integration_item_code=product)
 
 
+def is_sync_running() -> bool:
+	"""True while a full import is queued or running for this site."""
+	from frappe.utils.background_jobs import get_jobs
+
+	site = frappe.local.site
+	return SYNC_JOB_NAME in get_jobs(site=site, queue="long", key="job_name").get(site, [])
+
+
+@frappe.whitelist()
+def get_sync_status():
+	return {"running": is_sync_running()}
+
+
 @frappe.whitelist()
 def import_all_products():
+	"""Old endpoint. Browsers that cached the old page script call it on every
+	page load (F10), so it no longer starts anything; the page now uses
+	start_full_import."""
+	return {"queued": False}
+
+
+@frappe.whitelist()
+def start_full_import():
+	# never queue a second full import next to a running one (F10)
+	if is_sync_running():
+		return {"queued": False}
+
 	frappe.enqueue(
 		queue_sync_all_products, queue="long", job_name=SYNC_JOB_NAME, key=REALTIME_KEY,
 	)
+	return {"queued": True}
 
 
 def queue_sync_all_products(*args, **kwargs):

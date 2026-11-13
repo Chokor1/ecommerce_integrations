@@ -23,26 +23,28 @@ shopify.ProductImporter = class {
 	}
 
 	init() {
-		console.log("init");
 		frappe.run_serially([
 			() => this.addMarkup(),
 			() => this.fetchProductCount(),
 			() => this.addTable(),
 			() => this.checkSyncStatus(),
 			() => this.listen(),
-			() => this.syncAll(),
 		]);
 	}
 
 	async checkSyncStatus() {
-		// const jobs = await frappe.db.get_list("RQ Job", {filters: {"status": ("in", ("queued", "started"))}});
-		// this.syncRunning = jobs.find(job => job.job_name == 'shopify.job.sync.all.products') !== undefined;
+		// v13 has no "RQ Job" doctype: ask the server for the queued/running job
+		const { message } = await frappe.call({
+			method: 'ecommerce_integrations.shopify.page.shopify_import_products.shopify_import_products.get_sync_status',
+		});
+		this.syncRunning = Boolean(message && message.running);
 
-		// if (this.syncRunning) {
-		// 	this.toggleSyncAllButton();
-		// 	this.logSync();
-		// }
+		if (this.syncRunning) {
+			this.toggleSyncAllButton();
+			this.logSync();
+		}
 
+		return this.syncRunning;
 	}
 
 	addMarkup() {
@@ -256,8 +258,6 @@ shopify.ProductImporter = class {
 		this.wrapper.on('click', '.btn-prev,.btn-next', e => this.switchPage(e));
 
 		// sync all products
-		console.log(this.wrapper.find('#btn-sync-all').length);
-
 		this.wrapper.on('click', '#btn-sync-all', e => this.syncAll(e));
 
 	}
@@ -308,20 +308,23 @@ shopify.ProductImporter = class {
 
 	}
 
-	syncAll() {
-		console.log("syncAll")
-		this.checkSyncStatus();
-		this.toggleSyncAllButton();
-
-		if (this.syncRunning) {
+	async syncAll() {
+		if (this.syncRunning || await this.checkSyncStatus()) {
 			frappe.msgprint(__('Sync already in progress'));
-		} else {
-			frappe.call({ method: 'ecommerce_integrations.shopify.page.shopify_import_products.shopify_import_products.import_all_products' })
+			return;
 		}
 
-		// sync progress
-		this.logSync();
+		const { message } = await frappe.call({
+			method: 'ecommerce_integrations.shopify.page.shopify_import_products.shopify_import_products.start_full_import',
+		});
 
+		if (!(message && message.queued)) {
+			frappe.msgprint(__('Sync already in progress'));
+		}
+
+		this.syncRunning = true;
+		this.toggleSyncAllButton();
+		this.logSync();
 	}
 
 	logSync() {
@@ -354,7 +357,6 @@ shopify.ProductImporter = class {
 	}
 
 	toggleSyncAllButton(disable = true) {
-		console.log("toggleSyncAllButton");
 		const btn = $('#btn-sync-all');
 
 		const _toggleClass = d => d ? 'btn-success' : 'btn-primary';
