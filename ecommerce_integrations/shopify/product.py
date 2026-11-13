@@ -1258,6 +1258,10 @@ def write_upload_log(status: bool, product: Product, item, action="Created") -> 
 			status="Error", request_data=product.to_dict(), message=msg, method="upload_erpnext_item",
 		)
 	else:
+		# keep the Shopify Catalogue page's copy of this product current
+		from ecommerce_integrations.shopify.catalogue import remember_product
+
+		remember_product(product)
 		create_shopify_log(
 			status="Success",
 			request_data=product.to_dict(),

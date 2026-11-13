@@ -26,8 +26,8 @@ frappe.ui.form.on("Shopify Setting", {
 	},
 
 	refresh: function (frm) {
-		frm.add_custom_button(__("Import Products"), function () {
-			frappe.set_route("shopify-import-products");
+		frm.add_custom_button(__("Shopify Catalogue"), function () {
+			frappe.set_route("shopify-catalogue");
 		});
 		frm.add_custom_button(__("View Logs"), () => {
 			frappe.set_route("List", "Ecommerce Integration Log", {

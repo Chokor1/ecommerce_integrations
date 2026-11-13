@@ -147,6 +147,7 @@ scheduler_events = {
 		"ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_sp_api_settings.schedule_get_order_details",
 	],
 	"hourly_long": [
+		"ecommerce_integrations.shopify.catalogue.refresh_shopify_snapshot",
 		"ecommerce_integrations.zenoti.doctype.zenoti_settings.zenoti_settings.sync_invoices",
 		"ecommerce_integrations.unicommerce.product.upload_new_items",
 		"ecommerce_integrations.unicommerce.status_updater.update_sales_order_status",
