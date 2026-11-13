@@ -7,6 +7,7 @@ import frappe
 from frappe import _, msgprint
 from frappe.utils import cint, cstr, strip_html
 from frappe.utils.nestedset import get_root_of
+from shopify.collection import PaginatedIterator
 from shopify.resources import Collect, CustomCollection, Product, Shop, Variant
 
 from ecommerce_integrations.ecommerce_integrations.doctype.ecommerce_item import ecommerce_item
@@ -328,9 +329,17 @@ def upload_erpnext_item(doc, method=None):
 	if doc.flags.from_integration or frappe.flags.in_import:
 		return
 
+	# A new item fires after_insert and then on_update: send it once (F8)
+	if method == "on_update" and doc.flags.in_insert:
+		return
+
+	# Nothing Shopify shows has changed: skip the whole upload (F8)
+	if not has_shopify_changes(doc) and _is_linked(doc.name):
+		return
+
 	frappe.flags.in_shopify_item_upload = True
 	try:
-		uploaded = _upload_erpnext_item(doc)
+		uploaded = _upload_erpnext_item(doc, sync_collections=_collections_changed(doc))
 	except Exception as e:
 		if _is_database_error(e):
 			raise
@@ -350,11 +359,52 @@ def upload_erpnext_item(doc, method=None):
 		frappe.flags.in_shopify_item_upload = False
 
 
+# Item fields that end up in Shopify (product, variant or collections)
+SHOPIFY_ITEM_FIELDS = (
+	"item_name",
+	"description",
+	"brand",
+	"disabled",
+	"item_group",
+	"gender",
+	"weight_per_unit",
+	"weight_uom",
+	"is_stock_item",
+	ITEM_SELLING_RATE_FIELD,
+)
+
+
+def _attribute_values(doc) -> list:
+	return [(a.attribute, a.attribute_value) for a in doc.get("attributes") or []]
+
+
+def has_shopify_changes(doc) -> bool:
+	"""True when a field Shopify uses changed in this save (or it's not a save)."""
+	before = doc.get_doc_before_save()
+	if not before:
+		return True
+	if any(before.get(f) != doc.get(f) for f in SHOPIFY_ITEM_FIELDS):
+		return True
+	return _attribute_values(before) != _attribute_values(doc)
+
+
+def _collections_changed(doc) -> bool:
+	return doc.has_value_changed("item_group") or doc.has_value_changed("gender")
+
+
+def _is_linked(item_code: str) -> bool:
+	return bool(
+		frappe.db.exists("Ecommerce Item", {"erpnext_item_code": item_code, "integration": MODULE_NAME})
+	)
+
+
 @temp_shopify_session
-def _upload_erpnext_item(doc):
+def _upload_erpnext_item(doc, sync_collections=True):
 	"""Push the item to Shopify. Returns True when something was sent.
 
-	Raises on any Shopify failure; callers decide whether to retry."""
+	Collections are only synced when `sync_collections` (Item Group or Gender
+	changed, a new product, or a retry). Raises on any Shopify failure;
+	callers decide whether to retry."""
 	template_item = item = doc  # alias for readability
 
 	setting = frappe.get_doc(SETTING_DOCTYPE)
@@ -476,8 +526,8 @@ def _upload_erpnext_item(doc):
 		add_or_update_variant(Variant(variant_attributes), product.variants)
 
 	_save_product(product)
-	unlink_collections_from_product(product.id)
-	sync_collections_from_erp_item(product.id, template_item)
+	if sync_collections:
+		sync_collections_from_erp_item(product.id, template_item)
 	if item.variant_of:
 		map_erpnext_variant_to_shopify_variant(product, item, variant_attributes)
 
@@ -850,139 +900,76 @@ def map_erpnext_variant_to_shopify_variant(
 
 
 
-# Cache to store recently fetched collections to avoid repeated API calls
-_collection_cache = {}
-_cache_timestamp = None
-CACHE_DURATION = 300  # 5 minutes
+# ---------------------------------------------------------------------------
+# Collections (F6/F11). Item Group (+ parents) and Gender become Shopify custom
+# collections. Only the difference is sent, and only collections whose title is
+# an Item Group or Gender are ever removed: collections assigned by hand in
+# Shopify are left alone. These helpers run inside the session opened by
+# _upload_erpnext_item, so they carry no session decorator of their own.
+# ---------------------------------------------------------------------------
+
+CACHE_DURATION = 300  # seconds the list of Shopify collections is reused
+_collection_index = {"by_title": {}, "by_id": {}, "loaded_at": None}
 
 
 def _log_collection_error(message: str) -> None:
-	"""Record a collection failure without committing mid-save.
-
-	create_shopify_log() commits the transaction on every call, so it must not be
-	used for step-by-step messages inside the Item save (F7). Errors go to the
-	standard Error Log, which is written in the same transaction as the save.
-	"""
+	"""Record a collection failure without committing mid-save (F7)."""
 	frappe.log_error(message=message, title="Shopify Collections")
 
 
 def clear_collection_cache():
-	"""Clear the collection cache to force fresh data fetch."""
-	global _collection_cache, _cache_timestamp
-	_collection_cache = {}
-	_cache_timestamp = None
+	"""Force the next lookup to re-read the collections from Shopify."""
+	_collection_index.update({"by_title": {}, "by_id": {}, "loaded_at": None})
 
 
-@temp_shopify_session
-def get_collection_by_title(title):
-	"""Get a specific collection by title using direct search."""
-	try:
-		collections = CustomCollection.find(title=title)
-		return collections[0] if collections else None
-	except Exception as e:
-		_log_collection_error(f"Error searching for collection '{title}': {e}")
-		return None
+def _get_collection_index() -> dict:
+	"""All custom collections, read once per CACHE_DURATION (one call per 250)."""
+	loaded_at = _collection_index["loaded_at"]
+	if loaded_at is None or time.time() - loaded_at > CACHE_DURATION:
+		by_title, by_id = {}, {}
+		for page in PaginatedIterator(CustomCollection.find(limit=250)):
+			for col in page:
+				title = (col.title or "").strip()
+				by_id[int(col.id)] = title
+				by_title.setdefault(title.lower(), int(col.id))
+		_collection_index.update({"by_title": by_title, "by_id": by_id, "loaded_at": time.time()})
+	return _collection_index
 
 
-@temp_shopify_session
-def find_collection_case_insensitive(target_title):
-	"""Find collection with case-insensitive matching."""
-	try:
-		for col in CustomCollection.find() or []:
-			if getattr(col, "title", None) and col.title.strip().lower() == target_title.lower():
-				return col
-		return None
-	except Exception as e:
-		_log_collection_error(f"Error in case-insensitive search for '{target_title}': {e}")
-		return None
+def _remember_collection(collection_id: int, title: str) -> None:
+	_collection_index["by_title"][title.lower()] = int(collection_id)
+	_collection_index["by_id"][int(collection_id)] = title
 
 
-@temp_shopify_session
 def get_or_create_shopify_collection(title: str) -> Optional[int]:
-	"""Fetch or create a Shopify CustomCollection by title."""
-	if not title or not title.strip():
+	"""Id of the custom collection with this title (any case), creating it if needed."""
+	title = (title or "").strip()
+	if not title:
 		return None
 
-	normalized_title = title.strip()
-	cache_key = normalized_title.lower()
-
-	import time
-
-	global _collection_cache, _cache_timestamp
-
-	current_time = time.time()
-	if _cache_timestamp is None or current_time - _cache_timestamp > CACHE_DURATION:
-		_collection_cache = {}
-		_cache_timestamp = current_time
-
-	if cache_key in _collection_cache:
-		return _collection_cache[cache_key]
-
 	try:
-		existing_collection = get_collection_by_title(
-			normalized_title
-		) or find_collection_case_insensitive(normalized_title)
-		if existing_collection:
-			_collection_cache[cache_key] = existing_collection.id
-			return existing_collection.id
+		collection_id = _get_collection_index()["by_title"].get(title.lower())
+		if collection_id:
+			return collection_id
+
+		# The list may be up to CACHE_DURATION old: ask Shopify before creating
+		existing = CustomCollection.find(title=title)
+		if existing:
+			_remember_collection(existing[0].id, existing[0].title or title)
+			return int(existing[0].id)
 
 		collection = CustomCollection()
-		collection.title = normalized_title
+		collection.title = title
 		collection.published = True
-
 		if collection.save():
-			_collection_cache[cache_key] = collection.id
-			return collection.id
+			_remember_collection(collection.id, title)
+			return int(collection.id)
 
-		error_msg = "Unknown error"
-		if getattr(collection, "errors", None):
-			error_msg = collection.errors.full_messages()
-		_log_collection_error(f"Failed to create collection '{normalized_title}': {error_msg}")
-		return None
-
+		errors = collection.errors.full_messages() if getattr(collection, "errors", None) else "Unknown error"
+		_log_collection_error(f"Failed to create collection '{title}': {errors}")
 	except Exception as e:
-		_log_collection_error(f"Error in get_or_create_shopify_collection for '{normalized_title}': {e}")
-		return None
-
-
-@temp_shopify_session
-def link_product_to_collections(product_id: int, collection_titles: List[str]):
-	"""Link a product to multiple collections, avoiding duplicates."""
-	unique_titles = list({title.strip() for title in collection_titles or [] if title and title.strip()})
-
-	for title in unique_titles:
-		collection_id = get_or_create_shopify_collection(title)
-		if not collection_id:
-			continue
-
-		try:
-			existing_collects = []
-			try:
-				existing_collects = Collect.find(product_id=product_id, collection_id=collection_id)
-			except Exception as find_error:
-				# Continue with creation attempt even if we can't check existing links
-				_log_collection_error(
-					f"Error checking existing collects for product {product_id}, "
-					f"collection {collection_id}: {find_error}"
-				)
-
-			if existing_collects:
-				continue
-
-			collect = Collect()
-			collect.product_id = product_id
-			collect.collection_id = collection_id
-
-			if not collect.save():
-				error_msg = "Unknown error"
-				if getattr(collect, "errors", None):
-					error_msg = collect.errors.full_messages()
-				_log_collection_error(
-					f"Failed to link product {product_id} to collection '{title}': {error_msg}"
-				)
-
-		except Exception as e:
-			_log_collection_error(f"Failed to link product {product_id} to collection '{title}': {e}")
+		_log_collection_error(f"Error finding or creating collection '{title}': {e}")
+	return None
 
 
 def get_all_parent_groups(item_group: str) -> List[str]:
@@ -990,7 +977,7 @@ def get_all_parent_groups(item_group: str) -> List[str]:
 
 	def recurse(group: str):
 		parent = frappe.db.get_value("Item Group", group, "parent_item_group")
-		if parent and parent != "All Item Groups":
+		if parent and parent != "All Item Groups" and parent not in parents:
 			parents.append(parent)
 			recurse(parent)
 
@@ -998,39 +985,81 @@ def get_all_parent_groups(item_group: str) -> List[str]:
 	return parents
 
 
-def sync_collections_from_erp_item(product_id: int, erpnext_item):
-	"""Sync collections from ERPNext item to Shopify, avoiding duplicates."""
-	collections = []
-
-	# Add item group and its parent groups
+def get_collection_titles_for_item(erpnext_item) -> List[str]:
+	"""Collections the product should be in: Item Group, its parents, Gender."""
+	titles = []
 	if erpnext_item.item_group:
-		collections.append(erpnext_item.item_group)
-		collections.extend(get_all_parent_groups(erpnext_item.item_group))
+		titles.append(erpnext_item.item_group)
+		titles.extend(get_all_parent_groups(erpnext_item.item_group))
 
-	# Add gender if it exists
-	gender = getattr(erpnext_item, "gender", None)
+	gender = erpnext_item.get("gender")
 	if gender and gender.strip():
-		collections.append(gender.strip())
+		titles.append(gender)
 
-	collections = list({col.strip() for col in collections if col and col.strip()})
+	unique = {}
+	for title in titles:
+		title = (title or "").strip()
+		if title:
+			unique.setdefault(title.lower(), title)
+	return list(unique.values())
 
-	if collections:
-		link_product_to_collections(product_id, collections)
+
+def is_erp_managed_collection(title: Optional[str]) -> bool:
+	"""True when the title is an Item Group or a Gender (the database compares
+	without case), i.e. a collection this integration creates."""
+	title = (title or "").strip()
+	if not title:
+		return False
+	if frappe.db.exists("Item Group", title):
+		return True
+	return bool(frappe.db.exists("DocType", "Gender") and frappe.db.exists("Gender", title))
 
 
-@temp_shopify_session
-def unlink_collections_from_product(product_id: int):
+def sync_collections_from_erp_item(product_id: int, erpnext_item) -> None:
+	"""Add the product to missing collections and remove it from ERP-managed
+	collections it no longer belongs to. Nothing else is touched."""
+	wanted = {}
+	for title in get_collection_titles_for_item(erpnext_item):
+		collection_id = get_or_create_shopify_collection(title)
+		if collection_id:
+			wanted[int(collection_id)] = title
+
 	try:
-		collects = Collect.find(product_id=product_id)
-
-		for collect in collects:
-			try:
-				collect.destroy()
-			except Exception as e:
-				_log_collection_error(f"Failed to delete collect {collect.id}: {e}")
-
+		current = {int(c.collection_id): c for c in Collect.find(product_id=product_id, limit=250)}
 	except Exception as e:
-		_log_collection_error(f"Failed to fetch collects for product {product_id}: {e}")
+		_log_collection_error(f"Failed to read collections of product {product_id}: {e}")
+		return
+
+	for collection_id in wanted.keys() - current.keys():
+		try:
+			collect = Collect({"product_id": product_id, "collection_id": collection_id})
+			if not collect.save():
+				errors = collect.errors.full_messages() if getattr(collect, "errors", None) else "Unknown error"
+				_log_collection_error(
+					f"Failed to add product {product_id} to collection '{wanted[collection_id]}': {errors}"
+				)
+		except Exception as e:
+			_log_collection_error(f"Failed to add product {product_id} to collection '{wanted[collection_id]}': {e}")
+
+	stale = current.keys() - wanted.keys()
+	if not stale:
+		return
+
+	try:
+		titles = _get_collection_index()["by_id"]
+	except Exception as e:
+		_log_collection_error(f"Failed to read collection titles: {e}")
+		return
+
+	for collection_id in stale:
+		if not is_erp_managed_collection(titles.get(collection_id)):
+			continue  # assigned by hand in Shopify (or unknown): keep it
+		try:
+			current[collection_id].destroy()
+		except Exception as e:
+			_log_collection_error(
+				f"Failed to remove product {product_id} from collection '{titles.get(collection_id)}': {e}"
+			)
 
 
 
