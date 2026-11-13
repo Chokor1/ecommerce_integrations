@@ -372,6 +372,13 @@ body.scat-page .scat { --navbar-height: 0px; }
 
 .scat-foot-bar { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-top: 1px solid var(--sc-line); color: var(--sc-text-3); }
 .scat-foot-bar .scat-spacer { flex: 1; }
+.scat-loading { display: inline-flex; align-items: center; gap: 6px; color: var(--sc-text-3); }
+.scat-loading svg.icon { width: 13px; height: 13px; animation: scatSpin 0.9s linear infinite; }
+.scat-size-label { font-size: 12px; }
+.scat-seg { display: inline-flex; padding: 2px; border-radius: var(--sc-r); background: var(--sc-surface-3); border: 1px solid var(--sc-line); }
+.scat-size { height: 24px; min-width: 38px; padding: 0 8px; border: 0; border-radius: 6px; background: none; color: var(--sc-text-2); font-weight: 550; font-size: 12px; cursor: pointer; transition: background 0.15s, color 0.15s; }
+.scat-size:hover { color: var(--sc-text); }
+.scat-size.is-on { background: var(--sc-surface); color: var(--sc-accent); box-shadow: var(--sc-shadow), 0 0 0 1px var(--sc-line); }
 
 /* states */
 .scat-skel td { padding: 14px 12px; }

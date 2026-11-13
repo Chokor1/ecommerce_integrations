@@ -28,6 +28,7 @@ from ecommerce_integrations.shopify.constants import (
 SNAPSHOT = "Shopify Catalogue Product"
 ROLE = "System Manager"
 PAGE_LENGTH = 50
+PAGE_LENGTHS = (20, 50, 100, 500)
 EXPORT_LIMIT = 20000
 BULK_LIMIT = 5000
 MAX_VARIANTS = 100  # Shopify REST limit per product
@@ -185,26 +186,31 @@ def _only_shopify_where(filters: dict, values: dict) -> str:
 
 
 @frappe.whitelist()
-def get_catalogue(bucket="not_in_shopify", filters=None, start=0, sort="stock"):
+def get_catalogue(bucket="not_in_shopify", filters=None, start=0, sort="stock", page_length=PAGE_LENGTH, with_counts=1):
+	"""One batch of rows. The page loads the next batch as the table is
+	scrolled to its end; counts are only needed with the first batch."""
 	_check_access()
 	filters = frappe.parse_json(filters) or {}
 	start = max(cint(start), 0)
+	page_length = cint(page_length) if cint(page_length) in PAGE_LENGTHS else PAGE_LENGTH
 	base, where, values = _context(filters)
-
-	counts = frappe.db.sql(
-		f"select {', '.join(f'sum({cond}) as `{key}`' for key, cond in BUCKETS.items())} from {base} where {where}",
-		values,
-		as_dict=1,
-	)[0]
-	counts = {key: cint(value) for key, value in counts.items()}
-
 	only_values = {}
-	counts["only_shopify"] = cint(
-		frappe.db.sql(
-			f"select count(*) from `tab{SNAPSHOT}` sp where {_only_shopify_where(filters, only_values)}",
-			only_values,
-		)[0][0]
-	)
+	_only_shopify_where(filters, only_values)
+
+	counts = None
+	if cint(with_counts):
+		counts = frappe.db.sql(
+			f"select {', '.join(f'sum({cond}) as `{key}`' for key, cond in BUCKETS.items())} from {base} where {where}",
+			values,
+			as_dict=1,
+		)[0]
+		counts = {key: cint(value) for key, value in counts.items()}
+		counts["only_shopify"] = cint(
+			frappe.db.sql(
+				f"select count(*) from `tab{SNAPSHOT}` sp where {_only_shopify_where(filters, {})}",
+				only_values,
+			)[0][0]
+		)
 
 	if bucket == "only_shopify":
 		rows = frappe.db.sql(
@@ -213,7 +219,7 @@ def get_catalogue(bucket="not_in_shopify", filters=None, start=0, sort="stock"):
 				sp.total_inventory as shopify_inventory, sp.vendor as brand, sp.product_type as item_group,
 				sp.skus
 			from `tab{SNAPSHOT}` sp where {_only_shopify_where(filters, only_values)}
-			order by sp.title limit %(start)s, {PAGE_LENGTH}""",
+			order by sp.title limit %(start)s, {page_length}""",
 			dict(only_values, start=start),
 			as_dict=1,
 		)
@@ -222,7 +228,7 @@ def get_catalogue(bucket="not_in_shopify", filters=None, start=0, sort="stock"):
 		order = SORTS.get(sort, SORTS["stock"])
 		rows = frappe.db.sql(
 			f"select p.* from {base} where {where} and {BUCKETS[bucket]} order by {order}"
-			f" limit %(start)s, {PAGE_LENGTH}",
+			f" limit %(start)s, {page_length}",
 			dict(values, start=start),
 			as_dict=1,
 		)
@@ -230,10 +236,10 @@ def get_catalogue(bucket="not_in_shopify", filters=None, start=0, sort="stock"):
 
 	return {
 		"rows": rows,
-		"total": counts.get(bucket, 0),
+		"total": counts.get(bucket, 0) if counts else None,
 		"counts": counts,
 		"start": start,
-		"page_length": PAGE_LENGTH,
+		"page_length": page_length,
 	}
 
 

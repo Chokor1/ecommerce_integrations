@@ -139,6 +139,7 @@ frappe.provide("shopify");
 			],
 		},
 	];
+	const PAGE_LENGTHS = [20, 50, 100, 500];
 	const BUCKETS = {};
 	GROUPS.forEach((g) => g.items.forEach((b) => (BUCKETS[b.key] = b)));
 
@@ -161,7 +162,7 @@ frappe.provide("shopify");
 			if (!BUCKETS[this.bucket]) this.bucket = "not_in_shopify";
 			this.filters = store.get("filters", {}) || {};
 			this.sort = store.get("sort", "stock");
-			this.start = 0;
+			this.page_length = PAGE_LENGTHS.includes(store.get("page_length")) ? store.get("page_length") : 50;
 			this.rows = [];
 			this.selected = new Set();
 			this.all_matching = false;
@@ -295,7 +296,6 @@ frappe.provide("shopify");
 				if (key === "sort") {
 					this.sort = e.target.value;
 					store.set("sort", this.sort);
-					this.start = 0;
 					this.load();
 				} else {
 					this.set_filter(key, e.target.value);
@@ -304,14 +304,24 @@ frappe.provide("shopify");
 			this.$main.on("click", ".scat-clear", () => {
 				this.filters = {};
 				store.set("filters", this.filters);
-				this.start = 0;
 				this.render_tools();
 				this.load();
 			});
 
 			// table
-			this.$main.on("click", ".scat-page-prev", () => this.go(this.start - this.page_length));
-			this.$main.on("click", ".scat-page-next", () => this.go(this.start + this.page_length));
+			this.$main.on("click", ".scat-size", (e) => {
+				const size = Number($(e.currentTarget).attr("data-size"));
+				if (!PAGE_LENGTHS.includes(size) || size === this.page_length) return;
+				this.page_length = size;
+				store.set("page_length", size);
+				this.load();
+			});
+			// load the next batch when the table is scrolled near its end
+			this.$main.find(".scat-table-wrap").on("scroll", (e) => {
+				const el = e.currentTarget;
+				if (el.scrollTop + el.clientHeight >= el.scrollHeight - 240) this.load_more();
+			});
+			this.$main.on("click", ".scat-load-more", () => this.load_more());
 			this.$main.on("click", "tbody tr[data-key]", function (e) {
 				if ($(e.target).closest(".scat-check, .scat-row-act, a").length) return;
 				me.open_drawer($(this).attr("data-key"));
@@ -405,40 +415,76 @@ frappe.provide("shopify");
 			});
 		}
 
+		args(start, with_counts) {
+			return {
+				bucket: this.bucket,
+				filters: this.filters,
+				start,
+				sort: this.sort,
+				page_length: this.page_length,
+				with_counts: with_counts ? 1 : 0,
+			};
+		}
+
+		// first batch (with section counts); the rest arrive through load_more()
 		load() {
 			const token = (this.token = Math.random());
+			this.loading_more = false;
 			this.render_head();
 			this.render_skeleton();
 			return frappe
-				.call({
-					method: API + "get_catalogue",
-					args: { bucket: this.bucket, filters: this.filters, start: this.start, sort: this.sort },
-				})
+				.call({ method: API + "get_catalogue", args: this.args(0, true) })
 				.then(({ message }) => {
 					if (token !== this.token) return; // a newer request is on its way
 					this.rows = message.rows || [];
 					this.total = message.total || 0;
 					this.counts = message.counts || {};
-					this.page_length = message.page_length;
 					this.render_counts();
 					this.render_rows();
 					this.$main.find(".scat-table-wrap").scrollTop(0);
 					this.render_pager();
 					this.render_selbar();
+					this.fill_view();
 				});
 		}
 
-		go(start) {
-			this.start = Math.max(0, start);
-			this.load();
-			this.$main.find(".scat-table-wrap").scrollTop(0);
+		has_more() {
+			return this.rows.length < this.total;
+		}
+
+		load_more() {
+			if (this.loading_more || !this.has_more() || !this.rows.length) return;
+			const token = this.token;
+			this.loading_more = true;
+			this.render_pager();
+			frappe
+				.call({ method: API + "get_catalogue", args: this.args(this.rows.length, false) })
+				.then(({ message }) => {
+					if (token !== this.token) return; // the view changed meanwhile
+					const more = message.rows || [];
+					this.rows = this.rows.concat(more);
+					if (!more.length) this.total = this.rows.length;
+					this.append_rows(more);
+					this.render_selbar();
+				})
+				.always(() => {
+					if (token !== this.token) return;
+					this.loading_more = false;
+					this.render_pager();
+					this.fill_view();
+				});
+		}
+
+		// a small batch may not fill the table: keep loading until it scrolls
+		fill_view() {
+			const el = this.$main.find(".scat-table-wrap")[0];
+			if (el && this.has_more() && el.scrollHeight <= el.clientHeight + 40) this.load_more();
 		}
 
 		set_bucket(bucket) {
 			if (!BUCKETS[bucket]) return;
 			this.bucket = bucket;
 			store.set("bucket", bucket);
-			this.start = 0;
 			this.clear_selection(true);
 			this.close_drawer();
 			this.$side.find(".scat-group").removeClass("is-flyout");
@@ -451,7 +497,6 @@ frappe.provide("shopify");
 			if (value) this.filters[key] = value;
 			else delete this.filters[key];
 			store.set("filters", this.filters);
-			this.start = 0;
 			this.clear_selection(true);
 			this.render_tools(key === "search");
 			this.load();
@@ -631,10 +676,19 @@ frappe.provide("shopify");
 				this.sync_head_check();
 				return;
 			}
-			const html = this.rows.map((r) => (this.bucket === "only_shopify" ? this.row_shopify(r) : this.row_erp(r))).join("");
-			$body.html(html);
+			$body.html(this.rows_html(this.rows));
 			this.sync_head_check();
 			if (this.open_key) $body.find(`tr[data-key="${CSS.escape(this.open_key)}"]`).addClass("is-open");
+		}
+
+		rows_html(rows) {
+			return rows.map((r) => (this.bucket === "only_shopify" ? this.row_shopify(r) : this.row_erp(r))).join("");
+		}
+
+		append_rows(rows) {
+			if (!rows.length) return;
+			this.$main.find("tbody").append(this.rows_html(rows));
+			this.sync_head_check();
 		}
 
 		thumb(src) {
@@ -725,13 +779,20 @@ frappe.provide("shopify");
 		}
 
 		render_pager() {
-			const from = this.total ? this.start + 1 : 0;
-			const to = Math.min(this.start + this.rows.length, this.total);
+			const shown = Math.min(this.rows.length, this.total);
+			let status = "";
+			if (this.loading_more) status = `<span class="scat-loading">${icon("refresh")}${__("Loading more…")}</span>`;
+			else if (this.has_more())
+				status = `<button class="scat-clear scat-load-more">${__("Load {0} more", [num(Math.min(this.page_length, this.total - shown))])}</button>`;
 			this.$main.find(".scat-foot-bar").html(`
-				<span>${__("{0}–{1} of {2}", [num(from), num(to), num(this.total)])}</span>
+				<span>${this.total ? __("{0}–{1} of {2}", [num(1), num(shown), num(this.total)]) : __("0 of 0")}</span>
+				${status}
 				<span class="scat-spacer"></span>
-				<button class="scat-btn is-sm scat-page-prev" ${this.start <= 0 ? "disabled" : ""}>${__("Previous")}</button>
-				<button class="scat-btn is-sm scat-page-next" ${to >= this.total ? "disabled" : ""}>${__("Next")}</button>`);
+				<span class="scat-size-label" id="scat-size-label">${__("Load per scroll")}</span>
+				<div class="scat-seg" role="group" aria-labelledby="scat-size-label">${PAGE_LENGTHS.map(
+					(n) => `<button class="scat-size ${n === this.page_length ? "is-on" : ""}" data-size="${n}"
+						aria-pressed="${n === this.page_length}">${n}</button>`
+				).join("")}</div>`);
 		}
 
 		sync_head_check() {
