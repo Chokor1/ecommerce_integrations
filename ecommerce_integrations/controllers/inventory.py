@@ -18,7 +18,7 @@ def get_inventory_levels(warehouses: Tuple[str], integration: str) -> List[_dict
 	"""
 	data = frappe.db.sql(
 		f"""
-			SELECT ei.name as ecom_item, bin.item_code as item_code, integration_item_code, variant_id, actual_qty, warehouse, reserved_qty
+			SELECT ei.name as ecom_item, bin.item_code as item_code, integration_item_code, variant_id, ei.inventory_item_id, actual_qty, warehouse, reserved_qty
 			FROM `tabEcommerce Item` ei
 				JOIN tabBin bin
 				ON ei.erpnext_item_code = bin.item_code

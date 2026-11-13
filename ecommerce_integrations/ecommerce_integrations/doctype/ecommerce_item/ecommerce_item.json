@@ -13,6 +13,7 @@
   "has_variants",
   "variant_id",
   "variant_of",
+  "inventory_item_id",
   "inventory_synced_on",
   "item_synced_on"
  ],
@@ -77,6 +78,13 @@
    "search_index": 1
   },
   {
+   "description": "Shopify inventory item of this variant, stored by the stock sync so it is looked up only once.",
+   "fieldname": "inventory_item_id",
+   "fieldtype": "Data",
+   "label": "Inventory Item ID",
+   "read_only": 1
+  },
+  {
    "fieldname": "inventory_synced_on",
    "fieldtype": "Datetime",
    "label": "Inventory Synced On",
@@ -95,7 +103,7 @@
  ],
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2022-11-15 11:36:04.733227",
+ "modified": "2026-11-13 11:05:33.222497",
  "modified_by": "Administrator",
  "module": "Ecommerce Integrations",
  "name": "Ecommerce Item",
