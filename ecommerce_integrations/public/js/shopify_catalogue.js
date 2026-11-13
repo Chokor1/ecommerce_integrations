@@ -172,6 +172,15 @@ frappe.provide("shopify");
 
 		// ------------------------------------------------------------ shell
 		make() {
+			// Full-screen app like Invenza: the desk header is hidden by a body class
+			// that only holds on this route. v13 never calls on_page_hide and pushState
+			// routing fires no hashchange, so follow the desk's own page-change event.
+			const own_route = () =>
+				document.body.classList.toggle("scat-page", (frappe.get_route_str() || "").startsWith("shopify-catalogue"));
+			$(document).off("page-change.scat").on("page-change.scat", own_route);
+			own_route();
+			this.own_route = own_route;
+
 			this.wrapper.children(".page-head, .page-body").hide();
 			this.$root = $(`<div class="scat"></div>`).appendTo(this.wrapper);
 			if (store.get("rail", false) || window.innerWidth < 992) this.$root.addClass("is-rail");
@@ -179,9 +188,13 @@ frappe.provide("shopify");
 			this.$side = $(`
 				<aside class="scat-side" aria-label="${__("Catalogue sections")}">
 					<div class="scat-brand">
-						<div class="scat-brand-mark">${icon("sell", "md")}</div>
+						<div class="scat-brand-mark" title="${__("Shopify Catalogue")}"><svg class="scat-mark" viewBox="0 0 24 24" aria-hidden="true">
+								<path class="scat-mark-back" d="M10.4 2.2H5.2A2 2 0 0 0 3.2 4.2v5.2"/>
+								<path d="M13.6 5H8.4a2 2 0 0 0-2 2v5.4c0 .53.21 1.04.59 1.41l5.6 5.6a2 2 0 0 0 2.82 0l5.4-5.4a2 2 0 0 0 0-2.82l-5.6-5.6A2 2 0 0 0 13.6 5z"/>
+								<circle cx="10.6" cy="9.2" r="1.3"/>
+							</svg></div>
 						<div class="scat-brand-text">
-							<div class="scat-brand-name">${__("Shopify Catalogue")}</div>
+							<div class="scat-brand-name"><span class="scat-word-a">Shopify</span><span class="scat-word-b">Catalogue</span></div>
 							<div class="scat-brand-shop"></div>
 						</div>
 					</div>
@@ -193,6 +206,10 @@ frappe.provide("shopify");
 								aria-label="${__("Refresh Shopify data")}">${icon("refresh")}</button>
 						</div>
 						<div class="scat-foot-row">
+							<a class="scat-btn is-sm is-quiet" href="/app" title="${__("Back to ISOFT ERP")}"
+								aria-label="${__("Back to ISOFT ERP")}">${icon("home")}<span class="scat-hide-rail">${__("Desk")}</span></a>
+							<button class="scat-btn is-sm is-quiet scat-fullscreen" title="${__("Full screen")}"
+								aria-label="${__("Full screen")}">${icon("expand")}</button>
 							<button class="scat-btn is-sm is-quiet scat-rail-toggle" title="${__("Collapse sidebar")}"
 								aria-label="${__("Collapse sidebar")}">${icon("sidebar-collapse")}<span class="scat-hide-rail">${__("Collapse")}</span></button>
 						</div>
@@ -255,6 +272,15 @@ frappe.provide("shopify");
 				store.set("rail", this.$root.hasClass("is-rail"));
 			});
 			this.$side.on("click", ".scat-refresh", () => this.refresh_snapshot());
+			this.$side.on("click", ".scat-fullscreen", () => {
+				if (document.fullscreenElement) document.exitFullscreen();
+				else document.documentElement.requestFullscreen().catch(() => {});
+			});
+			$(document).off("fullscreenchange.scat").on("fullscreenchange.scat", () => {
+				const on = !!document.fullscreenElement;
+				this.$side.find(".scat-fullscreen").html(icon(on ? "collapse" : "expand"))
+					.attr({ title: on ? __("Exit full screen") : __("Full screen"), "aria-label": on ? __("Exit full screen") : __("Full screen") });
+			});
 			$(document).on("click.scat", (e) => {
 				if (!$(e.target).closest(".scat-group").length) this.$side.find(".scat-group").removeClass("is-flyout");
 			});
@@ -355,6 +381,7 @@ frappe.provide("shopify");
 		}
 
 		on_show() {
+			this.own_route();
 			if (this.meta) this.load();
 		}
 
@@ -653,7 +680,8 @@ frappe.provide("shopify");
 			const unpriced = r.unpriced
 				? `<span class="scat-sub is-bad">${r.has_variants ? __("{0} without price", [num(r.unpriced)]) : __("No price")}</span>`
 				: "";
-			const can_send = !r.disabled && (!r.product_id || r.unlinked_in_stock);
+			// nothing can go without a Shopify price, so don't offer it
+			const can_send = !r.disabled && r.max_rate > 0 && (!r.product_id || r.unlinked_in_stock);
 			const admin = this.admin_url(r.product_id);
 			return `<tr data-key="${esc(key)}" tabindex="0" class="${sel ? "is-selected" : ""}">
 				<td class="scat-col-check"><input type="checkbox" class="scat-check" ${sel ? "checked" : ""} aria-label="${esc(__("Select {0}", [r.item_name]))}"></td>

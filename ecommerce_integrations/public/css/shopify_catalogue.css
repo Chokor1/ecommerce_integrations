@@ -1,6 +1,19 @@
 /* Shopify Catalogue — Invenza shell (224/62px sidebar, slate surfaces, flat
    8px cards), Shopify green as the app accent. Light/dark follow the desk. */
 
+/* Full-screen app: hide the desk header (and ISOFT Desk's sidebar on sites that
+   run an older copy without this route in its list) only while on this route. */
+body.scat-page header.navbar,
+body.scat-page .navbar.navbar-default.navbar-fixed-top,
+body.scat-page .navbar-expand-lg,
+body.scat-page .page-head,
+body.scat-page .isd-sidebar { display: none !important; }
+body.scat-page .page-container,
+body.scat-page .main-section { padding-top: 0 !important; }
+body.scat-page .layout-main-section-wrapper { margin-top: 0 !important; }
+body.isd-on.scat-page { --isd-side-w: 0px !important; }
+body.scat-page .scat { --navbar-height: 0px; }
+
 .scat {
 	--sc-sb: 224px;
 	--sc-page: #f1f5f9;
@@ -98,9 +111,15 @@
 	display: grid;
 	place-items: center;
 }
-.scat-brand-mark svg.icon { width: 18px; height: 18px; stroke: #fff; }
+.scat-mark { width: 21px; height: 21px; fill: none; stroke: #fff; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.scat-mark circle { fill: #fff; stroke: none; }
+.scat-mark .scat-mark-back { opacity: 0.6; }
+[data-theme="dark"] .scat-mark { stroke: #06261c; }
+[data-theme="dark"] .scat-mark circle { fill: #06261c; }
 .scat-brand-text { min-width: 0; line-height: 1.25; }
-.scat-brand-name { font-weight: 650; font-size: 14px; letter-spacing: -0.01em; white-space: nowrap; }
+.scat-brand-name { font-size: 15px; line-height: 1.15; letter-spacing: -0.025em; white-space: nowrap; }
+.scat-word-a { font-weight: 750; color: var(--sc-accent); }
+.scat-word-b { font-weight: 600; color: var(--sc-text); margin-left: 3px; }
 .scat-brand-shop { color: var(--sc-text-3); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .scat-nav { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 8px; display: flex; flex-direction: column; gap: 2px; }
@@ -172,7 +191,9 @@
 .scat-fresh { display: flex; align-items: center; gap: 8px; color: var(--sc-text-3); font-size: 11.5px; line-height: 1.3; min-width: 0; }
 .scat-fresh-text { flex: 1; min-width: 0; }
 .scat-fresh-text b { color: var(--sc-text-2); font-weight: 600; display: block; }
-.scat-foot-row { display: flex; gap: 6px; }
+.scat-foot-row { display: flex; gap: 4px; align-items: center; }
+.scat-foot-row .scat-rail-toggle { margin-left: auto; }
+.scat-foot-row .scat-btn { padding: 0 8px; }
 
 /* rail */
 .scat.is-rail .scat-brand-text,
