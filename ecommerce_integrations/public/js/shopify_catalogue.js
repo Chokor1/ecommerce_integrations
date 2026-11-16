@@ -163,7 +163,8 @@ frappe.provide("shopify");
 			this.bucket = store.get("bucket", "not_in_shopify");
 			if (!BUCKETS[this.bucket]) this.bucket = "not_in_shopify";
 			this.filters = store.get("filters", {}) || {};
-			this.sort = store.get("sort", "stock");
+			this.sort = store.get("sort", "stock_desc");
+			if (!/_(asc|desc)$/.test(this.sort)) this.sort = "stock_desc";
 			this.page_length = PAGE_LENGTHS.includes(store.get("page_length")) ? store.get("page_length") : 50;
 			this.rows = [];
 			this.selected = new Set();
@@ -289,19 +290,23 @@ frappe.provide("shopify");
 			});
 
 			this.$main.on("click", ".scat-export", () => this.export_csv());
+			this.$main.on("change", ".scat-has-price", (e) => this.set_filter("has_price", e.target.checked ? 1 : ""));
+			// column sorting: a new column starts in its natural direction, a second click flips it
+			this.$main.on("click", ".scat-sort", (e) => {
+				const col = $(e.currentTarget).attr("data-sort");
+				const [cur, dir] = this.sort.split(/_(?=asc$|desc$)/);
+				const first = ["stock", "price", "variants"].includes(col) ? "desc" : "asc";
+				this.sort = `${col}_${cur === col ? (dir === "asc" ? "desc" : "asc") : first}`;
+				store.set("sort", this.sort);
+				this.load();
+			});
 
 			this.$main.on("input", ".scat-input", frappe.utils.debounce((e) => {
 				this.set_filter("search", e.target.value.trim());
 			}, 350));
 			this.$main.on("change", ".scat-select", (e) => {
 				const key = $(e.target).attr("data-filter");
-				if (key === "sort") {
-					this.sort = e.target.value;
-					store.set("sort", this.sort);
-					this.load();
-				} else {
-					this.set_filter(key, e.target.value);
-				}
+				this.set_filter(key, e.target.value);
 			});
 			this.$main.on("click", ".scat-clear", () => {
 				this.filters = {};
@@ -598,12 +603,6 @@ frappe.provide("shopify");
 				return `<select class="scat-select ${f[key] ? "is-set" : ""}" data-filter="${key}" aria-label="${esc(label)}">
 					<option value="">${esc(label)}</option>${opts}</select>`;
 			};
-			const sorts = [
-				["stock", __("Most stock first")],
-				["name", __("Name A–Z")],
-				["price", __("Highest price first")],
-				["newest", __("Newest first")],
-			];
 			const active = Object.keys(f).length;
 			const html = `
 				<label class="scat-search">${icon("search")}
@@ -615,8 +614,9 @@ frappe.provide("shopify");
 				${only ? "" : select("brand", __("Any brand"), this.meta.brands)}
 				${only ? "" : select("item_group", __("Any group"), this.meta.item_groups)}
 				${only || !this.meta.genders.length ? "" : select("gender", __("Any gender"), this.meta.genders)}
-				${only ? "" : `<select class="scat-select" data-filter="sort" aria-label="${__("Sort")}">
-					${sorts.map(([k, l]) => `<option value="${k}" ${this.sort === k ? "selected" : ""}>${l}</option>`).join("")}</select>`}
+				${only ? "" : `<label class="scat-toggle ${f.has_price ? "is-set" : ""}">
+					<input type="checkbox" class="scat-check scat-has-price" ${f.has_price ? "checked" : ""}>
+					${__("Hide products without price")}</label>`}
 				${active ? `<button class="scat-clear">${__("Clear filters")}</button>` : ""}`;
 			const $tools = this.$main.find(".scat-tools");
 			const caret = keep_search_focus ? $tools.find(".scat-input")[0]?.selectionStart : null;
@@ -632,19 +632,19 @@ frappe.provide("shopify");
 		columns() {
 			if (this.bucket === "only_shopify") {
 				return [
-					{ label: __("Shopify product") },
-					{ label: __("Variants"), num: true },
-					{ label: __("Shopify stock"), num: true },
-					{ label: __("Status") },
+					{ label: __("Shopify product"), sort: "name" },
+					{ label: __("Variants"), num: true, sort: "variants" },
+					{ label: __("Shopify stock"), num: true, sort: "stock" },
+					{ label: __("Status"), sort: "status" },
 				];
 			}
 			const store = this.filters.store && (this.meta.stores.find((s) => s.warehouse === this.filters.store) || {}).name;
 			return [
-				{ label: __("Product") },
-				{ label: store ? __("Stock in {0}", [store]) : __("Stock here"), num: true },
-				{ label: __("Variants in Shopify"), num: true },
-				{ label: __("Shopify price"), num: true },
-				{ label: __("Shopify") },
+				{ label: __("Product"), sort: "name" },
+				{ label: store ? __("Stock in {0}", [store]) : __("Stock here"), num: true, sort: "stock" },
+				{ label: __("Variants in Shopify"), num: true, sort: "variants" },
+				{ label: __("Shopify price"), num: true, sort: "price" },
+				{ label: __("Shopify"), sort: "status" },
 			];
 		}
 
@@ -657,10 +657,20 @@ frappe.provide("shopify");
 			);
 		}
 
+		th(c) {
+			if (!c.sort) return `<th class="${c.num ? "scat-num" : ""}">${esc(c.label)}</th>`;
+			const [cur, dir] = this.sort.split(/_(?=asc$|desc$)/);
+			const on = cur === c.sort;
+			const aria = on ? (dir === "asc" ? "ascending" : "descending") : "none";
+			return `<th class="${c.num ? "scat-num" : ""}" aria-sort="${aria}">
+				<button class="scat-sort ${on ? "is-on" : ""}" data-sort="${c.sort}"
+					title="${esc(__("Sort by {0}", [c.label]))}">${esc(c.label)}<span class="scat-sort-arrow">${icon(on ? (dir === "asc" ? "sort-ascending" : "sort-descending") : "sort", "xs")}</span></button></th>`;
+		}
+
 		render_thead(cols) {
 			this.$main.find("thead").html(`<tr>
 				<th class="scat-col-check"><input type="checkbox" class="scat-check" aria-label="${__("Select page")}"></th>
-				${cols.map((c) => `<th class="${c.num ? "scat-num" : ""}">${esc(c.label)}</th>`).join("")}
+				${cols.map((c) => this.th(c)).join("")}
 				<th class="scat-col-act"><span class="sr-only">${__("Actions")}</span></th></tr>`);
 		}
 

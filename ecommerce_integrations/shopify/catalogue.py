@@ -54,12 +54,35 @@ BUCKETS = {
 	"no_stock": "p.product_id is not null and p.stock <= 0 and p.shopify_status = 'active'",
 }
 
-SORTS = {
-	"stock": "p.stock desc, p.item_name asc",
-	"name": "p.item_name asc",
-	"newest": "p.creation desc",
-	"price": "p.max_rate desc, p.item_name asc",
+# Column sorting: "<column>_<asc|desc>". Ties fall back to the name.
+SORT_COLUMNS = {
+	"name": "p.item_name",
+	"stock": "p.stock",
+	"variants": "p.linked_variants",
+	"price": "p.max_rate",
+	"status": "p.shopify_status",
 }
+SHOPIFY_SORT_COLUMNS = {
+	"name": "sp.title",
+	"stock": "sp.total_inventory",
+	"variants": "sp.variants_count",
+	"price": "sp.title",
+	"status": "sp.status",
+}
+DEFAULT_SORT = "p.stock desc, p.item_name asc"
+SORTS = {"stock": DEFAULT_SORT}  # kept for callers that need the default order
+
+
+def _order_by(sort: str, shopify_only=False) -> str:
+	column, _sep, direction = cstr(sort).rpartition("_")
+	if direction not in ("asc", "desc"):
+		column, direction = cstr(sort), "desc" if cstr(sort) in ("stock", "price", "variants") else "asc"
+	columns = SHOPIFY_SORT_COLUMNS if shopify_only else SORT_COLUMNS
+	if column not in columns:
+		return "sp.title asc" if shopify_only else DEFAULT_SORT
+	tie = "sp.title asc" if shopify_only else "p.item_name asc"
+	# empty values (no price, not in Shopify) always go last
+	return f"{columns[column]} is null, {columns[column]} {direction}, {tie}"
 
 
 class SkipProduct(Exception):
@@ -179,6 +202,8 @@ def _context(filters: dict):
 			"(p.item_code like %(search)s or p.item_name like %(search)s"
 			" or exists (select 1 from tabItem sv where sv.variant_of = p.item_code and sv.name like %(search)s))"
 		)
+	if cint(filters.get("has_price")):
+		conds.append("p.max_rate > 0")
 	for key in ("brand", "item_group", "gender"):
 		if filters.get(key):
 			values[key] = filters[key]
@@ -200,7 +225,7 @@ def _only_shopify_where(filters: dict, values: dict) -> str:
 
 
 @frappe.whitelist()
-def get_catalogue(bucket="not_in_shopify", filters=None, start=0, sort="stock", page_length=PAGE_LENGTH, with_counts=1):
+def get_catalogue(bucket="not_in_shopify", filters=None, start=0, sort="stock_desc", page_length=PAGE_LENGTH, with_counts=1):
 	"""One batch of rows. The page loads the next batch as the table is
 	scrolled to its end; counts are only needed with the first batch."""
 	_check_access()
@@ -233,13 +258,13 @@ def get_catalogue(bucket="not_in_shopify", filters=None, start=0, sort="stock", 
 				sp.total_inventory as shopify_inventory, sp.vendor as brand, sp.product_type as item_group,
 				sp.skus
 			from `tab{SNAPSHOT}` sp where {_only_shopify_where(filters, only_values)}
-			order by sp.title limit %(start)s, {page_length}""",
+			order by {_order_by(sort, shopify_only=True)} limit %(start)s, {page_length}""",
 			dict(only_values, start=start),
 			as_dict=1,
 		)
 	else:
 		bucket = bucket if bucket in BUCKETS else "all"
-		order = SORTS.get(sort, SORTS["stock"])
+		order = _order_by(sort)
 		rows = frappe.db.sql(
 			f"select p.* from {base} where {where} and {BUCKETS[bucket]} order by {order}"
 			f" limit %(start)s, {page_length}",

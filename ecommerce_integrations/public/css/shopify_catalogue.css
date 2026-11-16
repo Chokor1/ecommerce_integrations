@@ -53,7 +53,8 @@ body.scat-page .scat { --navbar-height: 0px; }
 .scat * { scrollbar-width: thin; scrollbar-color: var(--sc-line-2) transparent; }
 .scat *::-webkit-scrollbar { width: 8px; height: 8px; }
 .scat *::-webkit-scrollbar-thumb { background: var(--sc-line-2); border-radius: 4px; }
-.scat button, .scat input, .scat select { font: inherit; color: inherit; }
+/* :where() keeps this reset at zero specificity so component colours win */
+:where(.scat) :where(button, input, select) { font: inherit; color: inherit; }
 .scat :focus { outline: none; }
 .scat :focus-visible { outline: none; box-shadow: 0 0 0 3px var(--sc-accent-ring); }
 .scat svg.icon { stroke: currentColor; }
@@ -301,6 +302,15 @@ body.scat-page .scat { --navbar-height: 0px; }
 .scat-select.is-set { border-color: var(--sc-accent); color: var(--sc-accent); font-weight: 550; }
 .scat-input:hover, .scat-select:hover { border-color: var(--sc-line-2); }
 .scat-input:focus, .scat-select:focus { border-color: var(--sc-accent); box-shadow: 0 0 0 3px var(--sc-accent-ring); }
+.scat-toggle { display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px; border-radius: var(--sc-r); border: 1px solid var(--sc-line); background: var(--sc-surface); color: var(--sc-text-2); cursor: pointer; white-space: nowrap; user-select: none; margin: 0; font-weight: 500; transition: border-color 0.15s, color 0.15s; }
+.scat-toggle:hover { border-color: var(--sc-line-2); color: var(--sc-text); }
+.scat-toggle.is-set { border-color: var(--sc-accent); color: var(--sc-accent); font-weight: 550; }
+.scat-sort { display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: none; color: inherit; font: inherit; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.scat-sort:hover, .scat-sort.is-on { color: var(--sc-text); }
+.scat-sort-arrow { display: inline-grid; opacity: 0.45; }
+.scat-sort-arrow svg.icon { width: 12px; height: 12px; }
+.scat-sort.is-on .scat-sort-arrow { opacity: 1; color: var(--sc-accent); }
+.scat-num .scat-sort { flex-direction: row-reverse; }
 .scat-clear { color: var(--sc-accent); background: none; border: 0; cursor: pointer; font-weight: 550; padding: 0 4px; }
 .scat-clear:hover { text-decoration: underline; text-underline-offset: 3px; }
 
