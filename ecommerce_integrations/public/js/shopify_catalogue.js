@@ -37,7 +37,7 @@ frappe.provide("shopify");
 					label: __("In stock, not in Shopify"),
 					icon: "upload",
 					tone: "warn",
-					action: "send",
+					actions: ["send"],
 					desc: __("Products with stock in the Shopify stores that are not in Shopify yet."),
 					empty: __("Every product with stock in the Shopify stores is in Shopify."),
 				},
@@ -46,16 +46,16 @@ frappe.provide("shopify");
 					label: __("Partly in Shopify"),
 					icon: "branch",
 					tone: "warn",
-					action: "send",
-					desc: __("In Shopify, but some variants with stock here are missing from the product."),
-					empty: __("No product is missing variants that have stock."),
+					actions: ["send"],
+					desc: __("In Shopify, but some variants are not. Send adds every missing variant that has a Shopify price, with or without stock."),
+					empty: __("No product in Shopify is missing variants."),
 				},
 				{
 					key: "missing_price",
 					label: __("Missing Shopify price"),
 					icon: "money-coins-1",
 					tone: "bad",
-					action: null,
+					actions: [],
 					desc: __("Variants without a Shopify Selling Rate are never sent, so they can't go live at 0. Set the rate on the item."),
 					empty: __("Every product in stock or in Shopify has a Shopify price."),
 				},
@@ -64,7 +64,7 @@ frappe.provide("shopify");
 					label: __("Waiting to sync"),
 					icon: "refresh",
 					tone: "bad",
-					action: null,
+					actions: [],
 					desc: __("Saves that could not reach Shopify. They are retried every 30 minutes."),
 					empty: __("Nothing is waiting: every change has reached Shopify."),
 				},
@@ -73,7 +73,7 @@ frappe.provide("shopify");
 					label: __("Disabled here, live in Shopify"),
 					icon: "restriction",
 					tone: "bad",
-					action: null,
+					actions: [],
 					desc: __("Disabled in ERPNext but still Active in Shopify. Saving the item again sets it to Draft."),
 					empty: __("No disabled product is still live in Shopify."),
 				},
@@ -89,8 +89,8 @@ frappe.provide("shopify");
 					label: __("All in Shopify"),
 					icon: "website",
 					tone: "brand",
-					action: "publish",
-					desc: __("Every product linked to a Shopify product."),
+					actions: ["send", "publish"],
+					desc: __("Every product linked to a Shopify product. Send adds variants that are still missing; Publish makes products visible."),
 					empty: __("No product is linked to Shopify yet."),
 				},
 				{
@@ -98,7 +98,7 @@ frappe.provide("shopify");
 					label: __("Not published"),
 					icon: "view",
 					tone: "warn",
-					action: "publish",
+					actions: ["publish", "send"],
 					desc: __("In Shopify as Draft or Archived, or Active but not on the online store."),
 					empty: __("Every product in Shopify is active and published."),
 				},
@@ -107,7 +107,7 @@ frappe.provide("shopify");
 					label: __("Active, no stock here"),
 					icon: "stock",
 					tone: "muted",
-					action: null,
+					actions: ["send"],
 					desc: __("Active in Shopify with no stock in the Shopify stores."),
 					empty: __("Every active product has stock in the Shopify stores."),
 				},
@@ -123,7 +123,7 @@ frappe.provide("shopify");
 					label: __("All products"),
 					icon: "list",
 					tone: "muted",
-					action: "send",
+					actions: ["send"],
 					desc: __("Every template and simple item in ERPNext."),
 					empty: __("No products match."),
 				},
@@ -132,7 +132,7 @@ frappe.provide("shopify");
 					label: __("Only in Shopify"),
 					icon: "arrow-down-left",
 					tone: "brand",
-					action: "import",
+					actions: ["import"],
 					desc: __("Shopify products that are not linked to any ERPNext item. Import creates the items here."),
 					empty: __("Every Shopify product is linked to an ERPNext item."),
 				},
@@ -364,9 +364,9 @@ frappe.provide("shopify");
 				this.render_selbar();
 			});
 			this.$selbar.on("click", ".scat-sel-clear", () => this.clear_selection());
-			this.$selbar.on("click", ".scat-sel-act", () => {
+			this.$selbar.on("click", ".scat-sel-act", (e) => {
 				const keys = this.all_matching ? null : [...this.selected];
-				this.run_action(BUCKETS[this.bucket].action, keys);
+				this.run_action($(e.currentTarget).attr("data-action"), keys);
 			});
 
 			// drawer
@@ -729,14 +729,16 @@ frappe.provide("shopify");
 			const variants = r.has_variants
 				? `${num(r.linked_variants)} / ${num(r.variants)}`
 				: r.product_id ? __("Yes") : `<span class="scat-muted">${__("No")}</span>`;
-			const missing = r.unlinked_in_stock
-				? `<span class="scat-sub is-warn">${__("{0} in stock missing", [num(r.unlinked_in_stock)])}</span>`
+			const missing = r.product_id && r.unlinked
+				? `<span class="scat-sub is-warn">${r.unlinked_in_stock
+					? __("{0} missing · {1} in stock", [num(r.unlinked), num(r.unlinked_in_stock)])
+					: __("{0} missing", [num(r.unlinked)])}</span>`
 				: "";
 			const unpriced = r.unpriced
 				? `<span class="scat-sub is-bad">${r.has_variants ? __("{0} without price", [num(r.unpriced)]) : __("No price")}</span>`
 				: "";
 			// nothing can go without a Shopify price, so don't offer it
-			const can_send = !r.disabled && r.max_rate > 0 && (!r.product_id || r.unlinked_in_stock);
+			const can_send = !r.disabled && r.missing_priced > 0;
 			const admin = this.admin_url(r.product_id);
 			return `<tr data-key="${esc(key)}" tabindex="0" class="${sel ? "is-selected" : ""}">
 				<td class="scat-col-check"><input type="checkbox" class="scat-check" ${sel ? "checked" : ""} aria-label="${esc(__("Select {0}", [r.item_name]))}"></td>
@@ -748,7 +750,7 @@ frappe.provide("shopify");
 				<td class="scat-num">${this.price(r)}${unpriced}</td>
 				<td>${this.status_pills(r)}</td>
 				<td class="scat-col-act">
-					${can_send ? `<button class="scat-btn is-sm is-icon scat-row-act" data-action="send" title="${__("Send to Shopify")}" aria-label="${__("Send to Shopify")}">${icon("upload")}</button>` : ""}
+					${can_send ? `<button class="scat-btn is-sm is-icon scat-row-act" data-action="send" title="${esc(r.product_id ? __("Send {0} missing variants to Shopify", [num(r.missing_priced)]) : __("Send to Shopify"))}" aria-label="${__("Send to Shopify")}">${icon("upload")}</button>` : ""}
 					${admin ? `<a class="scat-btn is-sm is-icon" href="${admin}" target="_blank" rel="noopener" title="${__("Open in Shopify")}" aria-label="${__("Open in Shopify")}">${icon("arrow-up-right")}</a>` : ""}
 				</td></tr>`;
 		}
@@ -812,7 +814,7 @@ frappe.provide("shopify");
 		}
 
 		render_selbar() {
-			const action = ACTIONS[BUCKETS[this.bucket].action];
+			const actions = (BUCKETS[this.bucket].actions || []).map((k) => [k, ACTIONS[k]]);
 			const n = this.all_matching ? this.total : this.selected.size;
 			this.$root.toggleClass("has-selection", !!n);
 			if (!n) {
@@ -824,7 +826,9 @@ frappe.provide("shopify");
 			this.$selbar.removeAttr("hidden").html(`
 				<span class="scat-selbar-text">${this.all_matching ? __("All <b>{0}</b> in this view", [num(n)]) : __("<b>{0}</b> selected", [num(n)])}</span>
 				${offer_all ? `<button class="scat-link-btn scat-sel-all">${__("Select all {0}", [num(this.total)])}</button>` : ""}
-				${action ? `<button class="scat-btn is-primary scat-sel-act">${icon(action.icon)}${esc(action.label)}</button>` : ""}
+				${actions
+					.map(([k, a], i) => `<button class="scat-btn ${i ? "" : "is-primary"} scat-sel-act" data-action="${k}">${icon(a.icon)}${esc(a.label)}</button>`)
+					.join("")}
 				<button class="scat-btn scat-sel-clear">${__("Clear")}</button>`);
 		}
 
@@ -1010,7 +1014,9 @@ frappe.provide("shopify");
 				? `${frappe.utils.to_title_case(sp.status || "")}${sp.published ? "" : " · " + __("not published")}`
 				: d.product_id ? __("In Shopify") : __("Not in Shopify");
 			const admin = this.admin_url(d.product_id);
-			const can_send = !item.disabled && variants.some((v) => !v.disabled && !v.in_shopify && v.price > 0);
+			const sendable = variants.filter((v) => !v.disabled && !v.in_shopify && v.price > 0).length;
+			const can_send = !item.disabled && sendable > 0;
+			const send_label = d.product_id ? __("Send {0} missing to Shopify", [num(sendable)]) : __("Send to Shopify");
 			const can_publish = d.product_id && sp && (sp.status !== "active" || !sp.published) && !item.disabled;
 
 			this.$drawer.html(`
@@ -1039,7 +1045,7 @@ frappe.provide("shopify");
 					</div>
 				</div>
 				<div class="scat-drawer-actions">
-					${can_send ? `<button class="scat-btn is-primary scat-drawer-act" data-action="send" data-key="${esc(item.name)}">${icon("upload")}${__("Send to Shopify")}</button>` : ""}
+					${can_send ? `<button class="scat-btn is-primary scat-drawer-act" data-action="send" data-key="${esc(item.name)}">${icon("upload")}${esc(send_label)}</button>` : ""}
 					${can_publish ? `<button class="scat-btn ${can_send ? "" : "is-primary"} scat-drawer-act" data-action="publish" data-key="${esc(item.name)}">${icon("view")}${__("Publish")}</button>` : ""}
 					<a class="scat-btn" href="/app/item/${encodeURIComponent(item.name)}">${icon("edit")}${__("Open item")}</a>
 					${admin ? `<a class="scat-btn" href="${admin}" target="_blank" rel="noopener">${icon("arrow-up-right")}${__("Open in Shopify")}</a>` : ""}

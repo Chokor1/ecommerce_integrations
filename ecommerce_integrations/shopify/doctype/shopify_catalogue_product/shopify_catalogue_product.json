@@ -121,7 +121,7 @@
  "in_create": 1,
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-11-13 12:00:00.000000",
+ "modified": "2026-11-16 12:53:36.131750",
  "modified_by": "Administrator",
  "module": "shopify",
  "name": "Shopify Catalogue Product",
@@ -133,6 +133,12 @@
    "read": 1,
    "report": 1,
    "role": "System Manager"
+  },
+  {
+   "export": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Shopify Catalogue Manager"
   }
  ],
  "read_only": 1,

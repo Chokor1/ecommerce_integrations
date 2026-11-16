@@ -4,7 +4,7 @@
  "docstatus": 0,
  "doctype": "Page",
  "idx": 0,
- "modified": "2026-11-13 12:00:00.000000",
+ "modified": "2026-11-16 12:53:36.131750",
  "modified_by": "Administrator",
  "module": "shopify",
  "name": "shopify-catalogue",
@@ -13,6 +13,9 @@
  "roles": [
   {
    "role": "System Manager"
+  },
+  {
+   "role": "Shopify Catalogue Manager"
   }
  ],
  "script": null,

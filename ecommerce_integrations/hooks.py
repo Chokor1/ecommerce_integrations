@@ -70,7 +70,7 @@ doctype_js = {
 # ------------
 
 # before_install = "ecommerce_integrations.install.before_install"
-# after_install = "ecommerce_integrations.install.after_install"
+after_install = "ecommerce_integrations.shopify.catalogue.ensure_role"
 
 
 before_uninstall = "ecommerce_integrations.uninstall.before_uninstall"

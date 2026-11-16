@@ -26,7 +26,8 @@ from ecommerce_integrations.shopify.constants import (
 )
 
 SNAPSHOT = "Shopify Catalogue Product"
-ROLE = "System Manager"
+ROLE = "Shopify Catalogue Manager"
+ROLES = ("System Manager", ROLE)  # who may open the page and run its actions
 PAGE_LENGTH = 50
 PAGE_LENGTHS = (20, 50, 100, 500)
 EXPORT_LIMIT = 20000
@@ -43,7 +44,7 @@ RETRY_METHOD = "ecommerce_integrations.shopify.product.retry_item_upload"
 BUCKETS = {
 	"all": "1 = 1",
 	"not_in_shopify": "p.product_id is null and p.disabled = 0 and p.stock > 0",
-	"partial": "p.product_id is not null and p.disabled = 0 and p.unlinked_in_stock > 0",
+	"partial": "p.product_id is not null and p.disabled = 0 and p.unlinked > 0",
 	"missing_price": "p.disabled = 0 and p.unpriced > 0 and (p.stock > 0 or p.product_id is not null)",
 	"pending": "p.pending > 0",
 	"disabled_live": "p.disabled = 1 and p.shopify_status = 'active'",
@@ -71,7 +72,16 @@ class SkipProduct(Exception):
 
 
 def _check_access():
-	frappe.only_for(ROLE)
+	frappe.only_for(ROLES)
+
+
+def ensure_role() -> None:
+	"""Create the Shopify Catalogue Manager role (patch + after_install).
+	Give it to a user to let them use the Shopify Catalogue page."""
+	if not frappe.db.exists("Role", ROLE):
+		frappe.get_doc(
+			{"doctype": "Role", "role_name": ROLE, "desk_access": 1, "is_custom": 0}
+		).insert(ignore_permissions=True)
 
 
 def _rate_column() -> str:
@@ -92,6 +102,8 @@ def _product_sql() -> str:
 			if(i.has_variants, ifnull(vs.linked_variants, 0), if(lk.name is null, 0, 1)) as linked_variants,
 			if(i.has_variants, ifnull(vs.unpriced, 0), if(i.disabled = 0 and {rate_i} <= 0, 1, 0)) as unpriced,
 			if(i.has_variants, ifnull(vs.unlinked_in_stock, 0), 0) as unlinked_in_stock,
+			if(i.has_variants, ifnull(vs.unlinked, 0), if(lk.name is null, 1, 0)) as unlinked,
+			if(i.has_variants, ifnull(vs.missing_priced, 0), if(lk.name is null and {rate_i} > 0, 1, 0)) as missing_priced,
 			if(i.has_variants, vs.min_rate, nullif({rate_i}, 0)) as min_rate,
 			if(i.has_variants, vs.max_rate, nullif({rate_i}, 0)) as max_rate,
 			lk.integration_item_code as product_id,
@@ -112,6 +124,8 @@ def _product_sql() -> str:
 				sum(v.disabled = 0 and e.name is not null) as linked_variants,
 				sum(v.disabled = 0 and {rate_v} <= 0) as unpriced,
 				sum(v.disabled = 0 and e.name is null and ifnull(vb.stock, 0) > 0) as unlinked_in_stock,
+				sum(v.disabled = 0 and e.name is null) as unlinked,
+				sum(v.disabled = 0 and e.name is null and {rate_v} > 0) as missing_priced,
 				min(if(v.disabled = 0, nullif({rate_v}, 0), null)) as min_rate,
 				max(if(v.disabled = 0, nullif({rate_v}, 0), null)) as max_rate
 			from tabItem v
@@ -624,6 +638,10 @@ def run_job(kind: str, targets: list):
 
 	handler = {"send": _send_product, "publish": _publish_product, "import": _import_product}[kind]
 	cache = frappe.cache()
+	# The caller passed the role check when the job was queued; items and links
+	# are created with full rights so a Shopify Catalogue Manager needs no
+	# separate permissions on Item / Ecommerce Item. The job records who asked.
+	frappe.set_user("Administrator")
 	frappe.flags.in_shopify_item_upload = True  # outages are reported here, not logged per call
 
 	for target in targets:
