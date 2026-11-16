@@ -112,6 +112,7 @@ doc_events = {
 		"validate": [
 			"ecommerce_integrations.utils.taxation.validate_tax_template",
 			"ecommerce_integrations.unicommerce.product.validate_item",
+			"ecommerce_integrations.shopify.pricing.on_item_validate",
 		],
 	},
 	"Sales Order": {
@@ -123,7 +124,12 @@ doc_events = {
 		"on_submit": "ecommerce_integrations.unicommerce.grn.upload_grn",
 		"on_cancel": "ecommerce_integrations.unicommerce.grn.prevent_grn_cancel",
 	},
-	"Item Price": {"on_change": "ecommerce_integrations.utils.price_list.discard_item_prices"},
+	"Item Price": {
+		"on_change": "ecommerce_integrations.utils.price_list.discard_item_prices",
+		# Shopify price follows the price list (any save, import or delete)
+		"on_update": "ecommerce_integrations.shopify.pricing.on_item_price_change",
+		"on_trash": "ecommerce_integrations.shopify.pricing.on_item_price_change",
+	},
 	"Pick List": {"validate": "ecommerce_integrations.unicommerce.pick_list.validate"},
 	"Sales Invoice": {
 		"on_submit": "ecommerce_integrations.unicommerce.invoice.on_submit",
@@ -137,7 +143,8 @@ doc_events = {
 scheduler_events = {
 	"all": ["ecommerce_integrations.shopify.inventory.update_inventory_on_shopify"],
 	"daily": [
-		"ecommerce_integrations.ecommerce_integrations.doctype.ecommerce_integration_log.ecommerce_integration_log.clear_old_logs_by_retention"
+		"ecommerce_integrations.ecommerce_integrations.doctype.ecommerce_integration_log.ecommerce_integration_log.clear_old_logs_by_retention",
+		"ecommerce_integrations.shopify.pricing.queue_prices_changing_today",
 	],
 	"daily_long": [
 		"ecommerce_integrations.zenoti.doctype.zenoti_settings.zenoti_settings.sync_stocks"

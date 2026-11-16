@@ -37,7 +37,7 @@ frappe.provide("shopify");
 					label: __("In stock, not in Shopify"),
 					icon: "upload",
 					tone: "warn",
-					actions: ["send"],
+					actions: ["send", "prices"],
 					desc: __("Products with stock in the Shopify stores that are not in Shopify yet."),
 					empty: __("Every product with stock in the Shopify stores is in Shopify."),
 				},
@@ -46,7 +46,7 @@ frappe.provide("shopify");
 					label: __("Partly in Shopify"),
 					icon: "branch",
 					tone: "warn",
-					actions: ["send"],
+					actions: ["send", "prices"],
 					desc: __("In Shopify, but some variants are not. Send adds every missing variant that has a Shopify price, with or without stock."),
 					empty: __("No product in Shopify is missing variants."),
 				},
@@ -55,8 +55,8 @@ frappe.provide("shopify");
 					label: __("Missing Shopify price"),
 					icon: "money-coins-1",
 					tone: "bad",
-					actions: [],
-					desc: __("Variants without a Shopify Selling Rate are never sent, so they can't go live at 0. Set the rate on the item."),
+					actions: ["prices"],
+					desc: __("Variants without a Shopify price are never sent, so they can't go live at 0. Add the price to the price list, or use Update prices if it is already there."),
 					empty: __("Every product in stock or in Shopify has a Shopify price."),
 				},
 				{
@@ -89,7 +89,7 @@ frappe.provide("shopify");
 					label: __("All in Shopify"),
 					icon: "website",
 					tone: "brand",
-					actions: ["send", "publish"],
+					actions: ["send", "publish", "prices"],
 					desc: __("Every product linked to a Shopify product. Send adds variants that are still missing; Publish makes products visible."),
 					empty: __("No product is linked to Shopify yet."),
 				},
@@ -98,7 +98,7 @@ frappe.provide("shopify");
 					label: __("Not published"),
 					icon: "view",
 					tone: "warn",
-					actions: ["publish", "send"],
+					actions: ["publish", "send", "prices"],
 					desc: __("In Shopify as Draft or Archived, or Active but not on the online store."),
 					empty: __("Every product in Shopify is active and published."),
 				},
@@ -107,7 +107,7 @@ frappe.provide("shopify");
 					label: __("Active, no stock here"),
 					icon: "stock",
 					tone: "muted",
-					actions: ["send"],
+					actions: ["send", "prices"],
 					desc: __("Active in Shopify with no stock in the Shopify stores."),
 					empty: __("Every active product has stock in the Shopify stores."),
 				},
@@ -123,7 +123,7 @@ frappe.provide("shopify");
 					label: __("All products"),
 					icon: "list",
 					tone: "muted",
-					actions: ["send"],
+					actions: ["send", "prices"],
 					desc: __("Every template and simple item in ERPNext."),
 					empty: __("No products match."),
 				},
@@ -147,11 +147,13 @@ frappe.provide("shopify");
 		send: { label: __("Send to Shopify"), icon: "upload", method: "send_to_shopify", key: "item_code" },
 		publish: { label: __("Publish"), icon: "view", method: "publish", key: "product_id" },
 		import: { label: __("Import"), icon: "arrow-down-left", method: "import_from_shopify", key: "product_id" },
+		prices: { label: __("Update prices"), icon: "money-coins-1", method: "update_prices", key: "item_code" },
 	};
 	const JOB_VERBS = {
 		send: __("Sending to Shopify"),
 		publish: __("Publishing"),
 		import: __("Importing from Shopify"),
+		prices: __("Updating prices"),
 	};
 
 	shopify.Catalogue = class Catalogue {
@@ -814,7 +816,10 @@ frappe.provide("shopify");
 		}
 
 		render_selbar() {
-			const actions = (BUCKETS[this.bucket].actions || []).map((k) => [k, ACTIONS[k]]);
+			const price_sync = this.meta && this.meta.price_sync && this.meta.price_sync.enabled;
+			const actions = (BUCKETS[this.bucket].actions || [])
+				.filter((k) => k !== "prices" || price_sync)
+				.map((k) => [k, ACTIONS[k]]);
 			const n = this.all_matching ? this.total : this.selected.size;
 			this.$root.toggleClass("has-selection", !!n);
 			if (!n) {
@@ -835,7 +840,9 @@ frappe.provide("shopify");
 		run_action(kind, keys) {
 			const action = ACTIONS[kind];
 			if (!action) return;
-			if (this.meta && !this.meta.enabled) {
+			// prices are worked out and stored even with the integration off; they
+			// reach Shopify once it is on
+			if (kind !== "prices" && this.meta && !this.meta.enabled) {
 				frappe.msgprint(__("The Shopify integration is disabled in Shopify Setting."));
 				return;
 			}
@@ -858,12 +865,16 @@ frappe.provide("shopify");
 					args[`${action.key}s`] = JSON.stringify(ids);
 					count = ids.length;
 				} else {
-					args[kind === "send" ? "item_codes" : "product_ids"] = JSON.stringify(keys);
+					args[action.key === "item_code" ? "item_codes" : "product_ids"] = JSON.stringify(keys);
 				}
 			} else {
 				args = { bucket: this.bucket, filters: JSON.stringify(this.filters) };
 			}
 
+			if (kind === "prices") {
+				this.preview_prices(args);
+				return;
+			}
 			const what = count === 1 ? __("1 product") : __("{0} products", [num(count)]);
 			const messages = {
 				send: __("Send {0} to Shopify?", [what]) + "<br><br>" +
@@ -874,16 +885,55 @@ frappe.provide("shopify");
 				publish: __("Set {0} Active and publish them to the online store?", [what]),
 				import: __("Import {0} from Shopify into ERPNext as items?", [what]),
 			};
-			frappe.confirm(messages[kind], () => {
-				frappe.call({ method: API + action.method, args, freeze: true }).then(({ message }) => {
-					this.job = message;
-					this.job_dismissed = null;
-					this.job_open = false;
-					this.clear_selection();
-					this.render_job();
-					this.poll_job();
-				});
+			frappe.confirm(messages[kind], () => this.start_job(action, args));
+		}
+
+		start_job(action, args) {
+			frappe.call({ method: API + action.method, args, freeze: true }).then(({ message }) => {
+				this.job = message;
+				this.job_dismissed = null;
+				this.job_open = false;
+				this.clear_selection();
+				this.render_job();
+				this.poll_job();
 			});
+		}
+
+		preview_prices(args) {
+			frappe
+				.call({ method: API + "preview_prices", args, freeze: true, freeze_message: __("Working out the prices…") })
+				.then(({ message: p }) => {
+					const f = (v) => format_currency(v, null, 0);
+					const rows = p.sample
+						.map((r) => `<tr><td><div class="scat-vlabel">${esc(r.item_name || r.item_code)}</div><div class="scat-vcode">${esc(r.item_code)}${r.in_shopify ? "" : " · " + __("not in Shopify")}</div></td>
+							<td class="scat-num">${r.old ? f(r.old) : `<span class="scat-muted">${__("none")}</span>`}</td>
+							<td class="scat-num"><b>${f(r.new)}</b></td></tr>`)
+						.join("");
+					const body = `
+						<div class="scat-dialog">
+							<p>${__("Price list <b>{0}</b> valid today, plus each item's tax, rounded to whole units.", [esc(p.price_list)])}</p>
+							<div class="scat-facts">
+								<div class="scat-fact"><span>${__("Will change")}</span><b>${num(p.change)}</b></div>
+								<div class="scat-fact"><span>${__("Of those, in Shopify")}</span><b>${num(p.change_in_shopify)}</b></div>
+								<div class="scat-fact"><span>${__("Already right")}</span><b>${num(p.unchanged)}</b></div>
+							</div>
+							${p.no_price ? `<p class="scat-sub is-warn">${__("{0} items have no price valid today in the price list and are left as they are.", [num(p.no_price)])}</p>` : ""}
+							${rows ? `<h4 class="scat-h4">${__("Biggest changes")}</h4>
+								<table class="scat-vtable"><thead><tr><th>${__("Item")}</th><th class="scat-num">${__("Now")}</th><th class="scat-num">${__("New")}</th></tr></thead>
+								<tbody>${rows}</tbody></table>` : ""}
+						</div>`;
+					const d = new frappe.ui.Dialog({
+						title: __("Update prices from the price list"),
+						size: "large",
+						fields: [{ fieldtype: "HTML", fieldname: "body", options: body }],
+						primary_action_label: p.change ? __("Update {0} prices", [num(p.change)]) : __("Close"),
+						primary_action: () => {
+							d.hide();
+							if (p.change) this.start_job(ACTIONS.prices, args);
+						},
+					});
+					d.show();
+				});
 		}
 
 		// ------------------------------------------------------------ job strip

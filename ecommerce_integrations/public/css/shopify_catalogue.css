@@ -474,3 +474,60 @@ body.scat-page .scat { --navbar-height: 0px; }
 @media (prefers-reduced-motion: reduce) {
 	.scat, .scat * { transition: none !important; animation: none !important; }
 }
+
+/* dialogs (outside .scat) use the same tokens */
+.scat-dialog {
+	--sc-sb: 224px;
+	--sc-page: #f1f5f9;
+	--sc-surface: #ffffff;
+	--sc-surface-2: #f8fafc;
+	--sc-surface-3: #f1f5f9;
+	--sc-line: #e2e8f0;
+	--sc-line-2: #cbd5e1;
+	--sc-text: #0f172a;
+	--sc-text-2: #334155;
+	--sc-text-3: #64748b;
+	--sc-accent: #008060;
+	--sc-accent-strong: #006e52;
+	--sc-accent-soft: #e6f4ef;
+	--sc-accent-ring: rgba(0, 128, 96, 0.28);
+	--sc-ok: #15803d;
+	--sc-ok-soft: #e8f5ec;
+	--sc-warn: #b45309;
+	--sc-warn-soft: #fdf3e6;
+	--sc-bad: #b91c1c;
+	--sc-bad-soft: #fdecec;
+	--sc-r: 8px;
+	--sc-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+	--sc-pop: 0 12px 28px rgba(15, 23, 42, 0.14);
+	color: var(--sc-text);
+	font-variant-numeric: tabular-nums;
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+}
+[data-theme="dark"] .scat-dialog {
+	--sc-page: #0b1220;
+	--sc-surface: #1e293b;
+	--sc-surface-2: #182236;
+	--sc-surface-3: #263244;
+	--sc-line: #334155;
+	--sc-line-2: #475569;
+	--sc-text: #f1f5f9;
+	--sc-text-2: #cbd5e1;
+	--sc-text-3: #94a3b8;
+	--sc-accent: #4cc79a;
+	--sc-accent-strong: #6fd8b0;
+	--sc-accent-soft: rgba(76, 199, 154, 0.16);
+	--sc-accent-ring: rgba(76, 199, 154, 0.35);
+	--sc-ok: #4ade80;
+	--sc-ok-soft: rgba(74, 222, 128, 0.14);
+	--sc-warn: #fbbf24;
+	--sc-warn-soft: rgba(251, 191, 36, 0.14);
+	--sc-bad: #f87171;
+	--sc-bad-soft: rgba(248, 113, 113, 0.14);
+	--sc-shadow: none;
+	--sc-pop: 0 12px 28px rgba(0, 0, 0, 0.5);
+}
+.scat-dialog p { margin: 0; color: var(--sc-text-2); line-height: 1.5; }
+.scat-dialog .scat-vtable { max-height: 320px; }

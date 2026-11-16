@@ -308,9 +308,20 @@ def get_meta():
 		shop_handle=shop.replace(".myshopify.com", ""),
 		enabled=bool(setting.is_enabled()),
 		new_products_active=bool(setting.sync_new_item_as_active),
+		price_sync=_price_sync_state(setting),
 		snapshot=_snapshot_state(),
 		job=_get_job(),
 	)
+
+
+def _price_sync_state(setting) -> dict:
+	from ecommerce_integrations.shopify import pricing
+
+	return {
+		"enabled": pricing.is_enabled(setting),
+		"price_list": setting.get("shopify_price_list"),
+		"tax_category": setting.get("tax_category"),
+	}
 
 
 def _snapshot_state() -> dict:
@@ -623,6 +634,52 @@ def import_from_shopify(product_ids=None, bucket=None, filters=None):
 	return _start_job("import", _resolve_targets(product_ids, "only_shopify", filters))
 
 
+def _require_price_sync():
+	from ecommerce_integrations.shopify import pricing
+
+	if not pricing.is_enabled():
+		frappe.throw(
+			_("Turn on \"Set Shopify price from a price list\" in Shopify Setting first."),
+			title=_("Shopify price"),
+		)
+
+
+@frappe.whitelist()
+def preview_prices(item_codes=None, bucket=None, filters=None):
+	"""What "Update prices" would do, before doing it."""
+	_check_access()
+	_require_price_sync()
+	from ecommerce_integrations.shopify import pricing
+
+	products = _resolve_targets(item_codes, bucket, filters)
+	items = pricing.sellable_items(products)
+	prices = pricing.compute_prices(items)
+	changes = [(code, p) for code, p in prices.items() if p["new"] is not None and p["new"] != p["old"]]
+	linked = set(pricing._variant_ids([code for code, _p in changes]))
+	changes.sort(key=lambda c: abs(c[1]["new"] - c[1]["old"]), reverse=True)
+	names = dict(frappe.get_all("Item", filters={"name": ["in", [c for c, _p in changes[:25]]]}, fields=["name", "item_name"], as_list=1)) if changes else {}
+	return {
+		"products": len(products),
+		"items": len(prices),
+		"change": len(changes),
+		"change_in_shopify": len(linked),
+		"unchanged": sum(1 for p in prices.values() if p["new"] is not None and p["new"] == p["old"]),
+		"no_price": sum(1 for p in prices.values() if p["new"] is None),
+		"sample": [
+			{"item_code": code, "item_name": names.get(code), "old": p["old"], "new": p["new"], "in_shopify": code in linked}
+			for code, p in changes[:25]
+		],
+		"price_list": _setting().get("shopify_price_list"),
+	}
+
+
+@frappe.whitelist()
+def update_prices(item_codes=None, bucket=None, filters=None):
+	_check_access()
+	_require_price_sync()
+	return _start_job("prices", _resolve_targets(item_codes, bucket, filters))
+
+
 @frappe.whitelist()
 def stop_job():
 	_check_access()
@@ -636,7 +693,12 @@ def stop_job():
 def run_job(kind: str, targets: list):
 	from ecommerce_integrations.shopify.product import _is_database_error, _is_shop_wide_error, _short_error
 
-	handler = {"send": _send_product, "publish": _publish_product, "import": _import_product}[kind]
+	handler = {
+		"send": _send_product,
+		"publish": _publish_product,
+		"import": _import_product,
+		"prices": _update_product_prices,
+	}[kind]
 	cache = frappe.cache()
 	# The caller passed the role check when the job was queued; items and links
 	# are created with full rights so a Shopify Catalogue Manager needs no
@@ -673,7 +735,8 @@ def run_job(kind: str, targets: list):
 		job = cache.get_value(JOB_KEY) or job
 		_record(job, target, outcome, note)
 		cache.set_value(JOB_KEY, job)
-		time.sleep(0.5)  # Shopify REST allows about 2 calls per second
+		if kind != "prices":  # price pushes pace themselves on Shopify's call-limit header
+			time.sleep(0.5)  # Shopify REST allows about 2 calls per second
 	else:
 		job = cache.get_value(JOB_KEY) or {}
 		job["status"] = "finished"
@@ -694,12 +757,33 @@ def _record(job: dict, target: str, outcome: str, note) -> None:
 		del problems[:-200]
 
 
+def _update_product_prices(item_code: str) -> str:
+	from ecommerce_integrations.shopify import pricing
+
+	stats = pricing.apply_prices(pricing.sellable_items([item_code]))
+	if not stats["changed"]:
+		if stats["no_price"] and not stats["unchanged"]:
+			raise SkipProduct(_("No price in the price list"))
+		return _("Already up to date")
+	note = _("{0} prices changed").format(stats["changed"])
+	if stats["sent"]:
+		note += " · " + _("{0} sent to Shopify").format(stats["sent"])
+	if stats["failed"]:
+		note += " · " + _("{0} waiting to sync").format(stats["failed"])
+	return note
+
+
 def _send_product(item_code: str) -> str:
+	from ecommerce_integrations.shopify import pricing
 	from ecommerce_integrations.shopify import product as sp
 
 	doc = frappe.get_doc("Item", item_code)
 	if doc.disabled:
 		raise SkipProduct(_("Disabled in ERPNext"))
+	if pricing.is_enabled():
+		# never send a stale price: bring the variants to today's price-list price
+		pricing.apply_prices(pricing.sellable_items([item_code]))
+		doc.reload()
 
 	rate = _rate_column()
 	if not doc.has_variants:

@@ -41,6 +41,11 @@
   "default_sales_tax_account",
   "column_break_qibo",
   "default_shipping_charges_account",
+  "shopify_price_section",
+  "sync_price_from_price_list",
+  "shopify_price_list",
+  "column_break_shopify_price",
+  "price_tax_rate",
   "erpnext_to_shopify_sync_section",
   "upload_erpnext_items",
   "update_shopify_item_on_update",
@@ -234,6 +239,37 @@
    "options": "Shopify Tax Account"
   },
   {
+   "fieldname": "shopify_price_section",
+   "fieldtype": "Section Break",
+   "label": "Shopify Price"
+  },
+  {
+   "default": "0",
+   "description": "Shopify price = the price valid today in this price list (or the template's), plus the item's tax for the Tax Category above, rounded to a whole unit. Updated on every Item Price save, import or delete, and sent to Shopify.",
+   "fieldname": "sync_price_from_price_list",
+   "fieldtype": "Check",
+   "label": "Set Shopify price from a price list"
+  },
+  {
+   "depends_on": "eval:doc.sync_price_from_price_list",
+   "fieldname": "shopify_price_list",
+   "fieldtype": "Link",
+   "label": "Price List",
+   "mandatory_depends_on": "eval:doc.sync_price_from_price_list",
+   "options": "Price List"
+  },
+  {
+   "fieldname": "column_break_shopify_price",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "14",
+   "depends_on": "eval:doc.sync_price_from_price_list",
+   "fieldname": "price_tax_rate",
+   "fieldtype": "Float",
+   "label": "Tax % when an item has no tax template"
+  },
+  {
    "fieldname": "erpnext_to_shopify_sync_section",
    "fieldtype": "Section Break",
    "label": "ERPNext to Shopify Sync"
@@ -399,7 +435,7 @@
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2026-11-13 11:17:02.375023",
+ "modified": "2026-11-16 13:16:10.350392",
  "modified_by": "Administrator",
  "module": "shopify",
  "name": "Shopify Setting",
